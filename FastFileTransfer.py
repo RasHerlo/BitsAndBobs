@@ -1,31 +1,72 @@
 
 # Function to copy files into a different folder (from Bard)
 
+# Comment on 240115: TryAndCatch needed, as many single files are corrupted
+# Solution: Temporarily copy the previous functional file and log the replacement in a log-file
+
+
 import os
 import shutil
+import time
+import datetime
+from ProcessLogger import log_init
+import logging
 
-def copy_folder_with_substring(source_folder, destination_folder, substring):
+def copy_files_with_substring(source_folder, destination_folder, substring):
     """
-    Copies folders containing files with the specified substring to the destination folder.
-    Also counts and prints the number of identified files before copying.
+    Copies files containing a specified substring from one folder to another.
+
+    Args:
+        source_folder (str): The path to the source folder.
+        destination_folder (str): The path to the destination folder.
+        substring (str): The substring to search for in filenames.
     """
+    print("Initiating copy_files_with_substring again again...")
+    print("Current directory is: {}".format(os.getcwd()))
 
-    print("Initiating...")
+    folders = destination_folder.split("\\")
+    logging.basicConfig(filename="".join(["logfile_", folders[-1], ".log"]), level=logging.DEBUG)
 
-    os.makedirs(destination_folder, exist_ok=True)
+    count = 0
+    errorcount = 0
 
-    matching_file_count = 0
+    t = time.time()
+    logging.info("run performed at {}".format(str(datetime.datetime.now())))
+    logging.info("Source-folder = {}, Destination-folder = {}".format(source_folder, destination_folder))
+    logging.info("FORMAT: corrupt 'file1' replaced by healthy 'file2': 'file1',file2'")
+    for filename in os.listdir(source_folder):
+        if substring in filename:
+            count += 1
+            try:
+                source_file = os.path.join(source_folder, filename)
+                destination_file = os.path.join(destination_folder, filename)
+                shutil.copy2(source_file, destination_file)
+                # cache the last non-corrupted file
+                if "000001" in filename:
+                    pl1 = filename
+                if "000002" in filename:
+                    pl2 = filename
 
-    for root, directories, files in os.walk(source_folder):
-        for directory in directories:
-            folder_path = os.path.join(root, directory)
-            if any(substring in file for file in os.listdir(folder_path)):
-                matching_files = [file for file in os.listdir(folder_path) if substring in file]
-                matching_file_count += len(matching_files)
-                print(f"Found {len(matching_files)} matching files in {folder_path}")
-
-                source_path = os.path.join(root, directory)
-                destination_path = os.path.join(destination_folder, directory)
-                shutil.copytree(source_path, destination_path)
-
-    print(f"Total of {matching_file_count} files with the substring '{substring}' were identified and copied.")
+                # update on progression live
+                if count % 2000 == 0:
+                    print("File number {} copied was {}".format(count, filename))
+                    print("Time passed: {} seconds".format(time.time()-t))
+            # if files are corrupt
+            except:
+                if "000001" in filename:
+                    logging.info("{},{}".format(filename, pl1))
+                    print("The file {} is corrupt, replaced by {}".format(filename, pl1))
+                    source_file = os.path.join(source_folder, pl1)
+                    shutil.copy2(source_file, destination_file)
+                    errorcount += 1
+                if "000002" in filename:
+                    logging.info("{},{}".format(filename, pl2))
+                    print("The file {} is corrupt, replaced by {}".format(filename, pl2))
+                    source_file = os.path.join(source_folder, pl2)
+                    shutil.copy2(source_file, destination_file)
+                    errorcount += 1
+            # if count == 400:
+            #     logging.info("Breaking at file #400 after {} seconds".format(time.time()-t))
+            #     break
+    logging.info("Finished at file #{} after {} seconds".format(count, time.time() - t))
+    logging.info("Total number of error-replacements = {}".format(errorcount))
