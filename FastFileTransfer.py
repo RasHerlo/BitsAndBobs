@@ -55,16 +55,16 @@ def copy_files_with_substring(source_folder, destination_folder, substring):
             except:
                 if "000001" in filename:
                     logging.info("{},{}".format(filename, pl1))
+                    errorcount += 1
                     print("The file {} is corrupt, replaced by {}".format(filename, pl1))
                     source_file = os.path.join(source_folder, pl1)
                     shutil.copy2(source_file, destination_file)
-                    errorcount += 1
                 if "000002" in filename:
                     logging.info("{},{}".format(filename, pl2))
+                    errorcount += 1
                     print("The file {} is corrupt, replaced by {}".format(filename, pl2))
                     source_file = os.path.join(source_folder, pl2)
                     shutil.copy2(source_file, destination_file)
-                    errorcount += 1
             # if count == 400:
             #     logging.info("Breaking at file #400 after {} seconds".format(time.time()-t))
             #     break
