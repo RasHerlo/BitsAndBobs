@@ -2,6 +2,8 @@
 
 #!/usr/bin/env python3
 
+# Requirements:
+# Filenames should not contain any dots (except fileformat), should start with "Chan" and index number is preceded by underscore, fx. ChanA_001_001_001_001.tif
 # function to identify all channel-specific tif-files in folder without Preview file
 # Should work no matter if the order of magnitude of your number of frames
 # Selects only the real tif files and avoids the preview files given
