@@ -10,6 +10,9 @@
 # Function is checking if the target folder is available, and if not,it leaves it with a message.
 # This avoids any overwriting or data-mixing.
 
+# Average of several measures indicate a speed of 11 frames/s total on a basic CPU system.
+# Not set up for parallel processing yet.
+
 # Folder selection
 import tkinter as tk
 from tkinter import filedialog
