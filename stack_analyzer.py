@@ -10,6 +10,7 @@ from tkinter import filedialog
 
 import matplotlib.pyplot as plt
 import matplotlib.widgets as widgets
+from matplotlib import colors as mcolors
 import numpy as np
 import tifffile
 from matplotlib.path import Path as MplPath
@@ -250,11 +251,33 @@ def clip_vertices(vertices: np.ndarray, width: int, height: int) -> np.ndarray:
 class EditableROI:
     """Freehand polygon ROI: draw, move, vertex-adjust, delete."""
 
-    def __init__(self, ax, image_shape: tuple[int, int], on_change, on_mode_change=None):
+    def __init__(
+        self,
+        ax,
+        image_shape: tuple[int, int],
+        on_change,
+        on_mode_change=None,
+        edge_color: str = "lime",
+        fill_color: str | None = None,
+        fill_alpha: float = 0.0,
+        handle_face_color: str = "yellow",
+        preview_color: str | None = None,
+        zorder: int = 5,
+        sibling: "EditableROI | None" = None,
+        enable_delete_key: bool = True,
+    ):
         self.ax = ax
         self.height, self.width = image_shape
         self.on_change = on_change
         self.on_mode_change = on_mode_change
+        self.edge_color = edge_color
+        self.fill_color = fill_color or edge_color
+        self.fill_alpha = fill_alpha
+        self.handle_face_color = handle_face_color
+        self.preview_color = preview_color or edge_color
+        self.zorder = zorder
+        self.sibling = sibling
+        self.enable_delete_key = enable_delete_key
 
         self.vertices: np.ndarray | None = None
         self.mask: np.ndarray | None = None
@@ -357,14 +380,17 @@ class EditableROI:
             self._update_handles()
             return
 
+        fill = self.fill_alpha > 0
+        facecolor = mcolors.to_rgba(self.fill_color, self.fill_alpha) if fill else "none"
         if self.patch is None:
             self.patch = Polygon(
                 self.vertices,
                 closed=True,
-                fill=False,
-                edgecolor="lime",
+                fill=fill,
+                facecolor=facecolor,
+                edgecolor=self.edge_color,
                 linewidth=2,
-                zorder=5,
+                zorder=self.zorder,
             )
             self.ax.add_patch(self.patch)
         else:
@@ -384,10 +410,10 @@ class EditableROI:
             linestyle="none",
             marker="o",
             markersize=5,
-            markerfacecolor="yellow",
-            markeredgecolor="lime",
+            markerfacecolor=self.handle_face_color,
+            markeredgecolor=self.edge_color,
             markeredgewidth=1,
-            zorder=6,
+            zorder=self.zorder + 1,
         )
 
     def _update_preview(self) -> None:
@@ -396,7 +422,9 @@ class EditableROI:
 
         xs, ys = zip(*self._current_stroke)
         if self.preview_line is None:
-            (self.preview_line,) = self.ax.plot(xs, ys, color="lime", linewidth=2, alpha=0.9)
+            (self.preview_line,) = self.ax.plot(
+                xs, ys, color=self.preview_color, linewidth=2, alpha=0.9, zorder=self.zorder + 1
+            )
         else:
             self.preview_line.set_data(xs, ys)
 
@@ -422,6 +450,20 @@ class EditableROI:
         self._current_stroke.append((x, y))
         self._update_preview()
 
+    def _sibling_takes_priority(self, x: float, y: float) -> bool:
+        sibling = self.sibling
+        if sibling is None:
+            return False
+        if sibling.draw_mode or sibling._drag_mode is not None:
+            return True
+        if sibling.vertices is None:
+            return False
+        if sibling._nearest_vertex(x, y) is not None:
+            return True
+        if self.zorder < sibling.zorder and sibling._contains_point(x, y):
+            return True
+        return False
+
     def _on_press(self, event) -> None:
         if event.button != 1:
             return
@@ -430,6 +472,9 @@ class EditableROI:
         if xy is None:
             return
         x, y = xy
+
+        if self._sibling_takes_priority(x, y):
+            return
 
         if self.vertices is not None:
             vertex_idx = self._nearest_vertex(x, y)
@@ -501,6 +546,8 @@ class EditableROI:
         self.ax.figure.canvas.draw_idle()
 
     def _on_key(self, event) -> None:
+        if not self.enable_delete_key:
+            return
         if event.key in ("delete", "backspace"):
             self.clear()
             self.ax.figure.canvas.draw_idle()
@@ -511,6 +558,7 @@ class StackAnalyzerApp:
         self.stack: np.ndarray | None = None
         self.z_average: np.ndarray | None = None
         self.raw_trace: np.ndarray | None = None
+        self.raw_bg_trace: np.ndarray | None = None
         self.smooth_trace: np.ndarray | None = None
         self.file_path = initial_path or ""
 
@@ -534,6 +582,10 @@ class StackAnalyzerApp:
         self.area_map_cache: np.ndarray | None = None
         self._heatmap_progress_artists: list = []
         self._heatmap_traces_dirty = True
+        self._heatmap_busy = False
+        self._heatmap_pending = False
+        self._heatmap_pending_full = False
+        self._block_area_slider_callbacks = False
 
         self.fig = plt.figure(figsize=(16, 9))
         self.fig.canvas.manager.set_window_title("Stack Analyzer")
@@ -549,7 +601,10 @@ class StackAnalyzerApp:
         gs.update(top=0.82, bottom=0.06, left=0.05, right=0.98)
 
         left_gs = gs[1:4, 0].subgridspec(2, 1, height_ratios=[0.90, 0.10], hspace=0.08)
-        self.ax_image = self.fig.add_subplot(left_gs[0, 0])
+        image_row_gs = left_gs[0, 0].subgridspec(1, 2, width_ratios=[1, 0.06], wspace=0.05)
+        self.ax_image = self.fig.add_subplot(image_row_gs[0, 0])
+        self.ax_heatmap_cbar = self.fig.add_subplot(image_row_gs[0, 1])
+        self.ax_heatmap_cbar.set_axis_off()
         toggle_ax = self.fig.add_subplot(left_gs[1, 0])
         toggle_ax.set_axis_off()
         self.check_heatmap = widgets.CheckButtons(toggle_ax, ["Heatmap"], [False])
@@ -561,6 +616,7 @@ class StackAnalyzerApp:
 
         self._build_controls()
         self.roi_tool: EditableROI | None = None
+        self.bg_roi_tool: EditableROI | None = None
 
         if initial_path:
             self.load_stack(initial_path)
@@ -582,6 +638,14 @@ class StackAnalyzerApp:
         self.btn_clear = widgets.Button(ax_clear, "Clear ROI")
         self.btn_clear.on_clicked(lambda _event: self._clear_roi())
 
+        ax_draw_bg = self.fig.add_axes([0.05, 0.815, 0.08, 0.035])
+        self.btn_draw_bg = widgets.Button(ax_draw_bg, "Draw BG")
+        self.btn_draw_bg.on_clicked(self._toggle_bg_draw_mode)
+
+        ax_clear_bg = self.fig.add_axes([0.14, 0.815, 0.08, 0.035])
+        self.btn_clear_bg = widgets.Button(ax_clear_bg, "Clear BG")
+        self.btn_clear_bg.on_clicked(lambda _event: self._clear_bg_roi())
+
         ax_window = self.fig.add_axes([0.30, 0.905, 0.18, 0.025])
         self.slider_window = widgets.Slider(ax_window, "SG window", 3, 501, valinit=51, valstep=2)
         self.slider_window.on_changed(lambda _val: self._update_analysis())
@@ -597,6 +661,7 @@ class StackAnalyzerApp:
         ax_starts = self.fig.add_axes([0.52, 0.855, 0.18, 0.035])
         self.text_starts = widgets.TextBox(ax_starts, "Starts", initial=self.starts_text)
         self.text_starts.on_submit(self._on_starts_changed)
+        self._patch_textbox_resize(self.text_starts)
 
         ax_area_left = self.fig.add_axes([0.74, 0.905, 0.18, 0.025])
         self.slider_area_left = widgets.Slider(ax_area_left, "Area L", 1, 60, valinit=1, valstep=1)
@@ -605,6 +670,19 @@ class StackAnalyzerApp:
         ax_area_right = self.fig.add_axes([0.74, 0.855, 0.18, 0.025])
         self.slider_area_right = widgets.Slider(ax_area_right, "Area R", 1, 60, valinit=60, valstep=1)
         self.slider_area_right.on_changed(lambda _val: self._on_area_slider_changed())
+
+    @staticmethod
+    def _patch_textbox_resize(textbox: widgets.TextBox) -> None:
+        """Work around matplotlib 3.11 passing ResizeEvent through a mouse-event wrapper."""
+        if not textbox._cids:
+            return
+        resize_cid = textbox._cids.pop()
+        textbox.canvas.mpl_disconnect(resize_cid)
+
+        def on_resize(event) -> None:
+            textbox.stop_typing()
+
+        textbox.connect_event("resize_event", on_resize)
 
     def _browse_file(self, _event) -> None:
         root = tk.Tk()
@@ -620,14 +698,28 @@ class StackAnalyzerApp:
     def _toggle_draw_mode(self, _event) -> None:
         if self.roi_tool is None:
             return
+        if self.bg_roi_tool is not None and self.bg_roi_tool.draw_mode:
+            self.bg_roi_tool.set_draw_mode(False)
+            self._sync_bg_draw_button()
         self.roi_tool.set_draw_mode(not self.roi_tool.draw_mode)
         self._sync_draw_button()
+
+    def _toggle_bg_draw_mode(self, _event) -> None:
+        if self.bg_roi_tool is None:
+            return
+        if self.roi_tool is not None and self.roi_tool.draw_mode:
+            self.roi_tool.set_draw_mode(False)
+            self._sync_draw_button()
+        self.bg_roi_tool.set_draw_mode(not self.bg_roi_tool.draw_mode)
+        self._sync_bg_draw_button()
 
     def _on_heatmap_toggled(self, _label: str) -> None:
         self.heatmap_enabled = bool(self.check_heatmap.get_status()[0])
         self._update_heatmap_display()
 
     def _on_area_slider_changed(self) -> None:
+        if self._block_area_slider_callbacks:
+            return
         self.area_map_cache = None
         self._update_plots()
         if self.heatmap_enabled:
@@ -640,12 +732,27 @@ class StackAnalyzerApp:
         self.btn_draw.label.set_text(label)
         self.fig.canvas.draw_idle()
 
+    def _sync_bg_draw_button(self) -> None:
+        if self.bg_roi_tool is None:
+            return
+        label = "Draw BG [ON]" if self.bg_roi_tool.draw_mode else "Draw BG"
+        self.btn_draw_bg.label.set_text(label)
+        self.fig.canvas.draw_idle()
+
     def _on_roi_mode_changed(self) -> None:
         self._sync_draw_button()
+
+    def _on_bg_mode_changed(self) -> None:
+        self._sync_bg_draw_button()
 
     def _clear_roi(self) -> None:
         if self.roi_tool is not None:
             self.roi_tool.clear()
+            self.fig.canvas.draw_idle()
+
+    def _clear_bg_roi(self) -> None:
+        if self.bg_roi_tool is not None:
+            self.bg_roi_tool.clear()
             self.fig.canvas.draw_idle()
 
     def _on_starts_changed(self, text: str) -> None:
@@ -661,10 +768,14 @@ class StackAnalyzerApp:
         self.slider_area_right.ax.set_xlim(1, max(2, total_len))
 
         signal_start = baseline_len + 1
-        if self.slider_area_left.val < 1 or self.slider_area_left.val > total_len:
-            self.slider_area_left.set_val(signal_start)
-        if self.slider_area_right.val > total_len or self.slider_area_right.val <= self.slider_area_left.val:
-            self.slider_area_right.set_val(total_len)
+        self._block_area_slider_callbacks = True
+        try:
+            if self.slider_area_left.val < 1 or self.slider_area_left.val > total_len:
+                self.slider_area_left.set_val(signal_start)
+            if self.slider_area_right.val > total_len or self.slider_area_right.val <= self.slider_area_left.val:
+                self.slider_area_right.set_val(total_len)
+        finally:
+            self._block_area_slider_callbacks = False
 
     def load_stack(self, path: str) -> None:
         try:
@@ -691,7 +802,25 @@ class StackAnalyzerApp:
             (height, width),
             self._on_roi_changed,
             on_mode_change=self._on_roi_mode_changed,
+            edge_color="lime",
+            zorder=5,
         )
+        self.bg_roi_tool = EditableROI(
+            self.ax_image,
+            (height, width),
+            self._on_bg_changed,
+            on_mode_change=self._on_bg_mode_changed,
+            edge_color="#1e88e5",
+            fill_color="#1e88e5",
+            fill_alpha=0.5,
+            handle_face_color="#bbdefb",
+            preview_color="#1e88e5",
+            zorder=4,
+            sibling=self.roi_tool,
+            enable_delete_key=False,
+        )
+        self.roi_tool.sibling = self.bg_roi_tool
+        self.raw_bg_trace = None
 
         self.slider_window.valmax = max(3, self.n_frames if self.n_frames % 2 else self.n_frames - 1)
         if self.slider_window.val > self.slider_window.valmax:
@@ -730,19 +859,47 @@ class StackAnalyzerApp:
         self.ax_image.set_ylim(height, 0)
         if self.roi_tool is not None:
             self.roi_tool._update_patch()
+        if self.bg_roi_tool is not None:
+            self.bg_roi_tool._update_patch()
 
     def _clear_heatmap_progress(self) -> None:
         for artist in self._heatmap_progress_artists:
-            artist.remove()
+            try:
+                artist.remove()
+            except (ValueError, AttributeError):
+                pass
         self._heatmap_progress_artists = []
 
-    def _clear_heatmap_layers(self) -> None:
-        if self.heatmap_overlay is not None:
+    def _safe_remove_heatmap_overlay(self) -> None:
+        if self.heatmap_overlay is None:
+            return
+        try:
             self.heatmap_overlay.remove()
-            self.heatmap_overlay = None
-        if self.heatmap_colorbar is not None:
-            self.heatmap_colorbar.remove()
-            self.heatmap_colorbar = None
+        except (ValueError, AttributeError):
+            pass
+        self.heatmap_overlay = None
+
+    def _hide_heatmap_colorbar_axis(self) -> None:
+        self.ax_heatmap_cbar.cla()
+        self.ax_heatmap_cbar.set_axis_off()
+
+    def _prepare_heatmap_colorbar_axis(self) -> None:
+        self.ax_heatmap_cbar.cla()
+        self.ax_heatmap_cbar.set_axis_on()
+
+    def _safe_remove_heatmap_colorbar(self) -> None:
+        colorbar = self.heatmap_colorbar
+        self.heatmap_colorbar = None
+        if colorbar is not None:
+            try:
+                colorbar.remove()
+            except (KeyError, ValueError, AttributeError):
+                pass
+        self._hide_heatmap_colorbar_axis()
+
+    def _clear_heatmap_layers(self) -> None:
+        self._safe_remove_heatmap_overlay()
+        self._safe_remove_heatmap_colorbar()
         self._clear_heatmap_progress()
 
     def _ensure_pixel_mean_traces(self) -> bool:
@@ -758,20 +915,22 @@ class StackAnalyzerApp:
 
         def report_progress(stage: str, fraction: float) -> None:
             self._set_heatmap_progress(stage, fraction)
-            self.fig.canvas.flush_events()
 
         self._set_heatmap_progress("Starting", 0.0)
-        self.fig.canvas.flush_events()
 
-        result = compute_all_pixel_mean_traces(
-            self.stack,
-            starts,
-            extension,
-            window,
-            poly,
-            self.baseline_fraction,
-            progress=report_progress,
-        )
+        self._block_area_slider_callbacks = True
+        try:
+            result = compute_all_pixel_mean_traces(
+                self.stack,
+                starts,
+                extension,
+                window,
+                poly,
+                self.baseline_fraction,
+                progress=report_progress,
+            )
+        finally:
+            self._block_area_slider_callbacks = False
         if result is None:
             self.pixel_mean_trace = None
             self.pixel_rel_x = None
@@ -843,6 +1002,12 @@ class StackAnalyzerApp:
         )
         self.ax_image.set_title(f"Z-average — heatmap {stage} ({pct}%)")
         self.fig.canvas.draw_idle()
+        self.fig.canvas.flush_events()
+
+    def _finalize_heatmap_render(self) -> None:
+        self._clear_heatmap_progress()
+        self.ax_image.set_title("Z-average + area heatmap")
+        self.fig.canvas.draw_idle()
 
     def _compute_area_map_cache(self) -> bool:
         if self.pixel_mean_trace is None or self.pixel_rel_x is None:
@@ -860,12 +1025,38 @@ class StackAnalyzerApp:
         self.area_map_cache = np.asarray(area_map, dtype=np.float64).reshape(height, width)
         return True
 
+    def _update_heatmap_overlay_inplace(self) -> bool:
+        if self.area_map_cache is None or self.heatmap_overlay is None:
+            return False
+
+        self._clear_heatmap_progress()
+        data = self.area_map_cache
+        self.heatmap_overlay.set_data(data)
+        vmin = float(np.nanmin(data))
+        vmax = float(np.nanmax(data))
+        if vmin >= vmax:
+            vmax = vmin + 1.0
+        self.heatmap_overlay.set_clim(vmin, vmax)
+        if self.heatmap_colorbar is not None:
+            self.heatmap_colorbar.update_normal(self.heatmap_overlay)
+        self.ax_image.set_title("Z-average + area heatmap")
+        if self.roi_tool is not None:
+            self.roi_tool._update_patch()
+        if self.bg_roi_tool is not None:
+            self.bg_roi_tool._update_patch()
+        self.fig.canvas.draw_idle()
+        return True
+
     def _show_heatmap_overlay(self) -> None:
         if self.area_map_cache is None or self.z_average is None:
             return
 
+        if self.heatmap_overlay is not None and self._update_heatmap_overlay_inplace():
+            return
+
         height, width = self.z_average.shape
-        self._clear_heatmap_layers()
+        self._safe_remove_heatmap_overlay()
+        self._safe_remove_heatmap_colorbar()
 
         if self.base_image is None:
             self._refresh_base_image()
@@ -878,15 +1069,34 @@ class StackAnalyzerApp:
             aspect="equal",
             zorder=2,
         )
-        self.ax_image.set_title("Z-average + area heatmap")
+        self._prepare_heatmap_colorbar_axis()
         self.heatmap_colorbar = self.fig.colorbar(
-            self.heatmap_overlay, ax=self.ax_image, fraction=0.046, pad=0.04
+            self.heatmap_overlay, cax=self.ax_heatmap_cbar
         )
         if self.roi_tool is not None:
             self.roi_tool._update_patch()
-        self.fig.canvas.draw_idle()
+        if self.bg_roi_tool is not None:
+            self.bg_roi_tool._update_patch()
+        self._finalize_heatmap_render()
 
     def _update_heatmap_display(self, integrate_only: bool = False) -> None:
+        if self._heatmap_busy:
+            self._heatmap_pending = True
+            if not integrate_only:
+                self._heatmap_pending_full = True
+            return
+        self._heatmap_busy = True
+        try:
+            self._update_heatmap_display_impl(integrate_only)
+        finally:
+            self._heatmap_busy = False
+            if self._heatmap_pending:
+                pending_full = self._heatmap_pending_full
+                self._heatmap_pending = False
+                self._heatmap_pending_full = False
+                self._update_heatmap_display(integrate_only=not pending_full)
+
+    def _update_heatmap_display_impl(self, integrate_only: bool = False) -> None:
         if not self.heatmap_enabled or self.stack is None:
             self._clear_heatmap_layers()
             self.ax_image.set_title("Z-average")
@@ -916,19 +1126,33 @@ class StackAnalyzerApp:
             self.fig.canvas.draw_idle()
             return
 
-        if self.area_map_cache is None or integrate_only:
+        if integrate_only:
+            if self.heatmap_overlay is not None and not self._heatmap_traces_dirty:
+                if not self._compute_area_map_cache():
+                    self._clear_heatmap_layers()
+                    self.ax_image.set_title("Z-average (heatmap: no valid segments)")
+                    self.fig.canvas.draw_idle()
+                    return
+                self._update_heatmap_overlay_inplace()
+                return
+
+            if not self._compute_area_map_cache():
+                self._clear_heatmap_layers()
+                self.ax_image.set_title("Z-average (heatmap: no valid segments)")
+                self.fig.canvas.draw_idle()
+                return
+            self._show_heatmap_overlay()
+            return
+
+        if self.area_map_cache is None:
             self._set_heatmap_progress("Integrating area map", 0.96)
-            self.fig.canvas.flush_events()
             if not self._compute_area_map_cache():
                 self._clear_heatmap_layers()
                 self.ax_image.set_title("Z-average (heatmap: no valid segments)")
                 self.fig.canvas.draw_idle()
                 return
 
-        self._clear_heatmap_progress()
         self._set_heatmap_progress("Rendering heatmap", 0.99)
-        self.fig.canvas.flush_events()
-        self._clear_heatmap_progress()
         self._show_heatmap_overlay()
 
     def _on_roi_changed(self) -> None:
@@ -937,22 +1161,35 @@ class StackAnalyzerApp:
         self.raw_trace = compute_raw_trace(self.stack, self.roi_tool.mask)
         self._update_roi_traces()
 
+    def _on_bg_changed(self) -> None:
+        if self.stack is None or self.bg_roi_tool is None:
+            return
+        self.raw_bg_trace = compute_raw_trace(self.stack, self.bg_roi_tool.mask)
+        self._update_roi_traces()
+
+    def _corrected_smooth_trace(self) -> np.ndarray | None:
+        if self.raw_trace is None:
+            return None
+
+        window = int(self.slider_window.val)
+        poly = int(self.slider_poly.val)
+        smooth_signal = apply_savgol(self.raw_trace, window, poly)
+        if self.raw_bg_trace is None:
+            return smooth_signal
+
+        smooth_bg = apply_savgol(self.raw_bg_trace, window, poly)
+        return smooth_signal - smooth_bg
+
     def _update_roi_traces(self) -> None:
         """Refresh ROI-based traces/plots only; heatmap is full-image and unchanged."""
         if self.stack is None:
             return
 
-        window = int(self.slider_window.val)
-        poly = int(self.slider_poly.val)
         self.extension = int(self.slider_extension.val)
         if self.n_frames > 0:
             self.start_frames = parse_start_frames(self.starts_text, self.n_frames)
 
-        if self.raw_trace is not None:
-            self.smooth_trace = apply_savgol(self.raw_trace, window, poly)
-        else:
-            self.smooth_trace = None
-
+        self.smooth_trace = self._corrected_smooth_trace()
         self._compute_mean_trace()
         self._update_plots()
 
@@ -995,8 +1232,13 @@ class StackAnalyzerApp:
         x = np.arange(n_frames) if n_frames else np.array([])
 
         self.ax_raw.clear()
-        if self.raw_trace is not None and n_frames:
-            self.ax_raw.plot(x, self.raw_trace, color="0.25", linewidth=0.8)
+        if n_frames:
+            if self.raw_trace is not None:
+                self.ax_raw.plot(x, self.raw_trace, color="0.25", linewidth=0.8, label="ROI")
+            if self.raw_bg_trace is not None:
+                self.ax_raw.plot(x, self.raw_bg_trace, color="#1e88e5", linewidth=0.8, label="BG")
+            if self.raw_trace is not None or self.raw_bg_trace is not None:
+                self.ax_raw.legend(loc="upper right", fontsize=8)
         self.ax_raw.set_ylabel("Intensity")
         self.ax_raw.set_title("raw")
         if n_frames:
@@ -1013,7 +1255,8 @@ class StackAnalyzerApp:
                 color = SEGMENT_COLORS[idx % len(SEGMENT_COLORS)]
                 self.ax_smooth.axvspan(start, start + extension, color=color, alpha=0.18, lw=0)
         self.ax_smooth.set_ylabel("Intensity")
-        self.ax_smooth.set_title("smoothed")
+        title = "smoothed (ROI − BG)" if self.raw_bg_trace is not None else "smoothed"
+        self.ax_smooth.set_title(title)
 
         self.ax_segments.clear()
         baseline_len, total_len, _ = segment_geometry(self.extension, self.baseline_fraction)
