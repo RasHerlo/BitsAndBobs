@@ -24,6 +24,8 @@ MIN_FREEHAND_POINTS = 4
 MIN_POINT_SPACING = 1.5
 MAX_EDIT_VERTICES = 64
 DEFAULT_STARTS = "896, 1050, 1205, 1359, 1513"
+DEFAULT_ACQ_FPS = 20.548
+DEFAULT_AVR = 4
 
 
 def load_tif_stack(path: str) -> np.ndarray:
@@ -190,6 +192,28 @@ def parse_start_frames(text: str, n_frames: int) -> list[int]:
     return values
 
 
+def parse_start_seconds(text: str, n_frames: int, fps: float) -> list[int]:
+    parts = [p.strip() for p in text.replace(";", ",").split(",") if p.strip()]
+    if not parts:
+        return [0]
+    if fps <= 0:
+        return parse_start_frames(text, n_frames)
+
+    values = [max(0, min(int(round(float(p) * fps)), n_frames - 1)) for p in parts]
+    return values
+
+
+def format_start_frames(frames: list[int]) -> str:
+    return ", ".join(str(int(f)) for f in frames)
+
+
+def format_start_seconds(frames: list[int], fps: float) -> str:
+    if fps <= 0:
+        return format_start_frames(frames)
+    seconds = [int(round(f / fps)) for f in frames]
+    return ", ".join(str(s) for s in seconds)
+
+
 def segment_geometry(extension: int, baseline_fraction: float = 0.2) -> tuple[int, int, np.ndarray]:
     """Return baseline length, total relative length, and 1-based relative frame axis."""
     baseline_len = max(1, int(round(baseline_fraction * extension)))
@@ -324,7 +348,22 @@ class EditableROI:
 
     def _remove_artist(self, artist) -> None:
         if artist is not None:
-            artist.remove()
+            try:
+                artist.remove()
+            except (ValueError, AttributeError):
+                pass
+        if artist is self.patch:
+            self.patch = None
+        if artist is self.handle_artists:
+            self.handle_artists = None
+        if artist is self.preview_line:
+            self.preview_line = None
+
+    def _artist_attached(self, artist) -> bool:
+        if artist is None:
+            return False
+        axes = getattr(artist, "axes", None)
+        return axes is not None
 
     def _clip_point(self, x: float, y: float) -> tuple[float, float]:
         return (
@@ -380,6 +419,9 @@ class EditableROI:
             self._update_handles()
             return
 
+        if self.patch is not None and not self._artist_attached(self.patch):
+            self.patch = None
+
         fill = self.fill_alpha > 0
         facecolor = mcolors.to_rgba(self.fill_color, self.fill_alpha) if fill else "none"
         if self.patch is None:
@@ -398,6 +440,9 @@ class EditableROI:
         self._update_handles()
 
     def _update_handles(self) -> None:
+        if self.handle_artists is not None and not self._artist_attached(self.handle_artists):
+            self.handle_artists = None
+
         self._remove_artist(self.handle_artists)
         self.handle_artists = None
 
@@ -565,8 +610,11 @@ class StackAnalyzerApp:
         self.n_frames = 0
         self.extension = 50
         self.baseline_fraction = 0.2
-        self.start_frames = [0]
+        self.start_frames = parse_start_frames(DEFAULT_STARTS, 0)
         self.starts_text = DEFAULT_STARTS
+        self.acq_fps = DEFAULT_ACQ_FPS
+        self.avr_factor = float(DEFAULT_AVR)
+        self.convert_time_axis = False
         self.baseline_level = 1.0
         self.rel_x: np.ndarray | None = None
         self.normalized_segments: list[np.ndarray] = []
@@ -663,6 +711,26 @@ class StackAnalyzerApp:
         self.text_starts.on_submit(self._on_starts_changed)
         self._patch_textbox_resize(self.text_starts)
 
+        ax_freq = self.fig.add_axes([0.52, 0.800, 0.11, 0.032])
+        self.text_freq = widgets.TextBox(ax_freq, "Freq (fps)", initial=str(DEFAULT_ACQ_FPS))
+        self.text_freq.on_submit(self._on_timing_changed)
+        self._patch_textbox_resize(self.text_freq)
+
+        ax_avr = self.fig.add_axes([0.64, 0.800, 0.05, 0.032])
+        self.text_avr = widgets.TextBox(ax_avr, "Avr", initial=str(DEFAULT_AVR))
+        self.text_avr.on_submit(self._on_timing_changed)
+        self._patch_textbox_resize(self.text_avr)
+
+        self.effective_fps_text = self.fig.text(
+            0.70, 0.816, "", fontsize=9, va="center", ha="left"
+        )
+        self._update_effective_fps_display()
+
+        ax_convert = self.fig.add_axes([0.78, 0.798, 0.07, 0.034])
+        ax_convert.set_axis_off()
+        self.check_convert = widgets.CheckButtons(ax_convert, ["convert"], [False])
+        self.check_convert.on_clicked(self._on_convert_toggled)
+
         ax_area_left = self.fig.add_axes([0.74, 0.905, 0.18, 0.025])
         self.slider_area_left = widgets.Slider(ax_area_left, "Area L", 1, 60, valinit=1, valstep=1)
         self.slider_area_left.on_changed(lambda _val: self._on_area_slider_changed())
@@ -757,7 +825,86 @@ class StackAnalyzerApp:
 
     def _on_starts_changed(self, text: str) -> None:
         self.starts_text = text
+        self.start_frames = self._parse_starts_from_text(text)
+        self._sync_starts_textbox_from_frames(self.start_frames)
         self._update_analysis()
+
+    def _parse_starts_from_text(self, text: str | None = None) -> list[int]:
+        raw = self.starts_text if text is None else text
+        if self.convert_time_axis:
+            return parse_start_seconds(raw, self.n_frames, self._effective_fps())
+        return parse_start_frames(raw, self.n_frames)
+
+    def _sync_starts_textbox_from_frames(self, frames: list[int]) -> None:
+        if self.convert_time_axis:
+            self.starts_text = format_start_seconds(frames, self._effective_fps())
+            self.text_starts.label.set_text("Starts (s)")
+        else:
+            self.starts_text = format_start_frames(frames)
+            self.text_starts.label.set_text("Starts")
+        self.text_starts.set_val(self.starts_text)
+
+    @staticmethod
+    def _parse_positive_float(text: str, default: float) -> float:
+        try:
+            value = float(text.strip().rstrip("xX").strip())
+            return value if value > 0 else default
+        except ValueError:
+            return default
+
+    def _effective_fps(self) -> float:
+        if self.avr_factor <= 0:
+            return 0.0
+        return self.acq_fps / self.avr_factor
+
+    def _update_effective_fps_display(self) -> None:
+        fps = self._effective_fps()
+        self.effective_fps_text.set_text(f"{fps:.3f} fps")
+
+    def _on_timing_changed(self, _text: str) -> None:
+        self.acq_fps = self._parse_positive_float(self.text_freq.text, DEFAULT_ACQ_FPS)
+        self.avr_factor = self._parse_positive_float(self.text_avr.text, float(DEFAULT_AVR))
+        self._update_effective_fps_display()
+        if self.convert_time_axis:
+            self._sync_starts_textbox_from_frames(self.start_frames)
+        self._update_plots()
+
+    def _on_convert_toggled(self, _label: str) -> None:
+        converting_to_seconds = bool(self.check_convert.get_status()[0])
+        if converting_to_seconds:
+            frames = parse_start_frames(self.text_starts.text, self.n_frames)
+        else:
+            frames = parse_start_seconds(
+                self.text_starts.text, self.n_frames, self._effective_fps()
+            )
+        self.start_frames = frames
+        self.convert_time_axis = converting_to_seconds
+        self._sync_starts_textbox_from_frames(self.start_frames)
+        self._update_analysis()
+
+    def _frame_to_axis(self, frame: float, *, one_based: bool = False) -> float:
+        if not self.convert_time_axis:
+            return frame
+        fps = self._effective_fps()
+        if fps <= 0:
+            return frame
+        origin = 1.0 if one_based else 0.0
+        return (frame - origin) / fps
+
+    def _frames_to_axis(self, frames: np.ndarray, *, one_based: bool = False) -> np.ndarray:
+        values = np.asarray(frames, dtype=float)
+        if not self.convert_time_axis:
+            return values
+        fps = self._effective_fps()
+        if fps <= 0:
+            return values
+        origin = 1.0 if one_based else 0.0
+        return (values - origin) / fps
+
+    def _trace_xlabel(self, *, relative: bool = False) -> str:
+        if self.convert_time_axis:
+            return "Time (s)"
+        return "Relative frame" if relative else "Frame"
 
     def _update_area_slider_limits(self) -> None:
         baseline_len, total_len, _ = segment_geometry(self.extension, self.baseline_fraction)
@@ -826,8 +973,8 @@ class StackAnalyzerApp:
         if self.slider_window.val > self.slider_window.valmax:
             self.slider_window.set_val(min(51, self.slider_window.valmax))
 
-        self.starts_text = DEFAULT_STARTS
-        self.text_starts.set_val(DEFAULT_STARTS)
+        self.start_frames = parse_start_frames(DEFAULT_STARTS, self.n_frames)
+        self._sync_starts_textbox_from_frames(self.start_frames)
         self._update_area_slider_limits()
 
         name = path if len(path) <= 120 else "…" + path[-117:]
@@ -846,7 +993,12 @@ class StackAnalyzerApp:
             return
         height, width = self.z_average.shape
         self._clear_heatmap_layers()
-        self.ax_image.clear()
+        if self.base_image is not None:
+            try:
+                self.base_image.remove()
+            except (ValueError, AttributeError):
+                pass
+            self.base_image = None
         self.base_image = self.ax_image.imshow(
             self.z_average,
             cmap="gray",
@@ -857,10 +1009,12 @@ class StackAnalyzerApp:
         self.ax_image.set_title("Z-average")
         self.ax_image.set_xlim(0, width)
         self.ax_image.set_ylim(height, 0)
-        if self.roi_tool is not None:
-            self.roi_tool._update_patch()
-        if self.bg_roi_tool is not None:
-            self.bg_roi_tool._update_patch()
+        self._redraw_rois()
+
+    def _redraw_rois(self) -> None:
+        for tool in (self.roi_tool, self.bg_roi_tool):
+            if tool is not None:
+                tool._update_patch()
 
     def _clear_heatmap_progress(self) -> None:
         for artist in self._heatmap_progress_artists:
@@ -908,7 +1062,7 @@ class StackAnalyzerApp:
         if not self._heatmap_traces_dirty and self.pixel_mean_trace is not None:
             return True
 
-        starts = parse_start_frames(self.starts_text, self.n_frames)
+        starts = self.start_frames
         window = int(self.slider_window.val)
         poly = int(self.slider_poly.val)
         extension = int(self.slider_extension.val)
@@ -1052,6 +1206,7 @@ class StackAnalyzerApp:
             return
 
         if self.heatmap_overlay is not None and self._update_heatmap_overlay_inplace():
+            self._finalize_heatmap_render()
             return
 
         height, width = self.z_average.shape
@@ -1186,8 +1341,6 @@ class StackAnalyzerApp:
             return
 
         self.extension = int(self.slider_extension.val)
-        if self.n_frames > 0:
-            self.start_frames = parse_start_frames(self.starts_text, self.n_frames)
 
         self.smooth_trace = self._corrected_smooth_trace()
         self._compute_mean_trace()
@@ -1196,6 +1349,7 @@ class StackAnalyzerApp:
     def _update_analysis(self) -> None:
         self._mark_heatmap_dirty()
         self._update_roi_traces()
+        self._redraw_rois()
         if self.heatmap_enabled:
             self._update_heatmap_display()
 
@@ -1229,7 +1383,8 @@ class StackAnalyzerApp:
 
     def _update_plots(self) -> None:
         n_frames = self.n_frames
-        x = np.arange(n_frames) if n_frames else np.array([])
+        stack_frames = np.arange(n_frames, dtype=float) if n_frames else np.array([])
+        x = self._frames_to_axis(stack_frames, one_based=False)
 
         self.ax_raw.clear()
         if n_frames:
@@ -1241,35 +1396,39 @@ class StackAnalyzerApp:
                 self.ax_raw.legend(loc="upper right", fontsize=8)
         self.ax_raw.set_ylabel("Intensity")
         self.ax_raw.set_title("raw")
+        self.ax_raw.set_xlabel(self._trace_xlabel())
         if n_frames:
-            self.ax_raw.set_xlim(0, n_frames - 1)
+            self.ax_raw.set_xlim(x[0], x[-1])
 
         self.ax_smooth.clear()
         if self.smooth_trace is not None and n_frames:
             self.ax_smooth.plot(x, self.smooth_trace, color="0.15", linewidth=1.0)
             extension = self.extension
-            baseline_len = max(1, int(round(self.baseline_fraction * extension)))
             for idx, start in enumerate(self.start_frames):
                 if start + extension > n_frames:
                     continue
                 color = SEGMENT_COLORS[idx % len(SEGMENT_COLORS)]
-                self.ax_smooth.axvspan(start, start + extension, color=color, alpha=0.18, lw=0)
+                span_left = self._frame_to_axis(start, one_based=False)
+                span_right = self._frame_to_axis(start + extension, one_based=False)
+                self.ax_smooth.axvspan(span_left, span_right, color=color, alpha=0.18, lw=0)
         self.ax_smooth.set_ylabel("Intensity")
         title = "smoothed (ROI − BG)" if self.raw_bg_trace is not None else "smoothed"
         self.ax_smooth.set_title(title)
+        self.ax_smooth.set_xlabel(self._trace_xlabel())
 
         self.ax_segments.clear()
         baseline_len, total_len, _ = segment_geometry(self.extension, self.baseline_fraction)
 
         if self.smooth_trace is not None and self.rel_x is not None and self.normalized_segments:
             rel_x = self.rel_x
+            seg_x = self._frames_to_axis(rel_x, one_based=True)
             for idx, seg_y in enumerate(self.normalized_segments):
                 color = SEGMENT_COLORS[idx % len(SEGMENT_COLORS)]
-                self.ax_segments.plot(rel_x, seg_y, color=color, linewidth=1.0, alpha=0.85)
+                self.ax_segments.plot(seg_x, seg_y, color=color, linewidth=1.0, alpha=0.85)
 
             if self.mean_trace_values is not None:
                 self.ax_segments.plot(
-                    rel_x,
+                    seg_x,
                     self.mean_trace_values,
                     color="black",
                     linewidth=3.0,
@@ -1285,7 +1444,7 @@ class StackAnalyzerApp:
                 label="baseline (=1)",
             )
             self.ax_segments.axvline(
-                baseline_len + 0.5,
+                self._frame_to_axis(baseline_len + 0.5, one_based=True),
                 color="0.7",
                 linestyle="-",
                 linewidth=0.8,
@@ -1297,14 +1456,24 @@ class StackAnalyzerApp:
             if f_right < f_left:
                 f_left, f_right = f_right, f_left
 
-            self.ax_segments.axvline(f_left, color="0.4", linestyle="--", linewidth=1.2)
-            self.ax_segments.axvline(f_right, color="0.4", linestyle="--", linewidth=1.2)
+            self.ax_segments.axvline(
+                self._frame_to_axis(f_left, one_based=True),
+                color="0.4",
+                linestyle="--",
+                linewidth=1.2,
+            )
+            self.ax_segments.axvline(
+                self._frame_to_axis(f_right, one_based=True),
+                color="0.4",
+                linestyle="--",
+                linewidth=1.2,
+            )
 
             self.computed_area = self._compute_area(f_left, f_right)
             if self.mean_trace_values is not None:
                 mask = (rel_x >= f_left) & (rel_x <= f_right)
                 if np.any(mask):
-                    area_x = rel_x[mask]
+                    area_x = seg_x[mask]
                     area_y = self.mean_trace_values[mask]
                     self.ax_segments.fill_between(
                         area_x,
@@ -1324,10 +1493,10 @@ class StackAnalyzerApp:
                 fontsize=10,
                 bbox={"boxstyle": "round", "facecolor": "white", "alpha": 0.8},
             )
-            self.ax_segments.set_xlim(1, total_len)
+            self.ax_segments.set_xlim(seg_x[0], seg_x[-1])
 
         self.ax_segments.set_ylabel("Normalized")
-        self.ax_segments.set_xlabel("Relative frame")
+        self.ax_segments.set_xlabel(self._trace_xlabel(relative=True))
         self.ax_segments.set_title("segments (overlaid)")
 
         self.fig.canvas.draw_idle()
