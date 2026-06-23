@@ -4,8 +4,11 @@
 from __future__ import annotations
 
 import argparse
+import os
+import pickle
 import tkinter as tk
 from collections.abc import Callable
+from pathlib import Path
 from tkinter import filedialog
 
 import matplotlib.pyplot as plt
@@ -26,6 +29,165 @@ MAX_EDIT_VERTICES = 64
 DEFAULT_STARTS = "896, 1050, 1205, 1359, 1513"
 DEFAULT_ACQ_FPS = 20.548
 DEFAULT_AVR = 4
+ROI_QUANT_PICKLE_NAME = "ROI_quant pickle.pkl"
+
+QUANT_COLUMNS = [
+    "directory",
+    "size",
+    "starts",
+    "freq + avr",
+    "SG window and order",
+    "extension",
+    "Area L+R",
+    "BG pixels",
+    "BG trc",
+    "ROI pixels",
+    "ROI trc",
+    "Area",
+    "max vals",
+    "bleach correct",
+]
+
+
+def quant_pickle_path_for_stack(stack_path: str) -> Path:
+    return Path(stack_path).resolve().parent / ROI_QUANT_PICKLE_NAME
+
+
+def empty_quant_store() -> dict:
+    return {"version": 1, "columns": QUANT_COLUMNS, "rows": []}
+
+
+def load_quant_store(path: Path) -> dict:
+    if not path.exists():
+        return empty_quant_store()
+    with path.open("rb") as handle:
+        data = pickle.load(handle)
+    if not isinstance(data, dict) or "rows" not in data:
+        return empty_quant_store()
+    if "columns" not in data:
+        data["columns"] = QUANT_COLUMNS
+    return data
+
+
+def save_quant_store(path: Path, store: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("wb") as handle:
+        pickle.dump(store, handle, protocol=pickle.HIGHEST_PROTOCOL)
+
+
+def ensure_quant_pickle(stack_path: str) -> Path:
+    path = quant_pickle_path_for_stack(stack_path)
+    if not path.exists():
+        save_quant_store(path, empty_quant_store())
+    return path
+
+
+def compute_max_vals_per_segment(
+    normalized_segments: list[np.ndarray],
+    rel_x: np.ndarray,
+    f_left: int,
+    f_right: int,
+) -> list[float]:
+    if f_right < f_left:
+        f_left, f_right = f_right, f_left
+    mask = (rel_x >= f_left) & (rel_x <= f_right)
+    if not np.any(mask):
+        return [float("nan")] * len(normalized_segments)
+
+    max_vals: list[float] = []
+    for segment in normalized_segments:
+        region = segment[mask]
+        valid = region[~np.isnan(region)]
+        max_vals.append(float(np.max(valid)) if valid.size else float("nan"))
+    return max_vals
+
+
+def format_stack_size(width: int, height: int, n_frames: int) -> str:
+    return f"{width}x{height}x{n_frames}"
+
+
+def parse_freq_avr_field(text: str) -> tuple[float, float]:
+    parts = [p.strip() for p in str(text).split(",") if p.strip()]
+    if len(parts) < 2:
+        raise ValueError(f"Invalid freq + avr field: {text!r}")
+    fps = float(parts[0].lower().replace("fps", "").strip())
+    avr = float(parts[1].lower().replace("x", "").strip())
+    return fps, avr
+
+
+def format_freq_avr_field(acq_fps: float, avr_factor: float) -> str:
+    avr_display = (
+        f"{int(avr_factor)}x" if float(avr_factor).is_integer() else f"{avr_factor}x"
+    )
+    return f"{acq_fps} fps, {avr_display}"
+
+
+def parse_sg_field(text: str) -> tuple[int, int]:
+    parts = [p.strip() for p in str(text).split(",") if p.strip()]
+    if len(parts) < 2:
+        raise ValueError(f"Invalid SG window and order field: {text!r}")
+    return int(float(parts[0])), int(float(parts[1]))
+
+
+def format_sg_field(window: int, poly: int) -> str:
+    return f"{int(window)}, {int(poly)}"
+
+
+def parse_area_lr_field(text: str) -> tuple[int, int]:
+    parts = [p.strip() for p in str(text).split(",") if p.strip()]
+    if len(parts) < 2:
+        raise ValueError(f"Invalid Area L+R field: {text!r}")
+    left, right = int(float(parts[0])), int(float(parts[1]))
+    if right < left:
+        left, right = right, left
+    return left, right
+
+
+def format_area_lr_field(left: int, right: int) -> str:
+    if right < left:
+        left, right = right, left
+    return f"{left}, {right}"
+
+
+def quant_settings_from_row(row: dict) -> dict:
+    fps, avr = parse_freq_avr_field(row["freq + avr"])
+    sg_window, sg_poly = parse_sg_field(row["SG window and order"])
+    area_left, area_right = parse_area_lr_field(row["Area L+R"])
+    extension_raw = row.get("extension", "50")
+    return {
+        "starts": str(row["starts"]),
+        "acq_fps": fps,
+        "avr_factor": avr,
+        "sg_window": sg_window,
+        "sg_poly": sg_poly,
+        "extension": int(float(extension_raw)),
+        "area_left": area_left,
+        "area_right": area_right,
+    }
+
+
+def quant_settings_to_row_fields(settings: dict) -> dict:
+    return {
+        "starts": settings["starts"],
+        "freq + avr": format_freq_avr_field(settings["acq_fps"], settings["avr_factor"]),
+        "SG window and order": format_sg_field(settings["sg_window"], settings["sg_poly"]),
+        "extension": str(int(settings["extension"])),
+        "Area L+R": format_area_lr_field(settings["area_left"], settings["area_right"]),
+    }
+
+
+def quant_settings_equal(left: dict, right: dict) -> bool:
+    if left["starts"].replace(" ", "") != right["starts"].replace(" ", ""):
+        return False
+    if abs(left["acq_fps"] - right["acq_fps"]) > 1e-6:
+        return False
+    if abs(left["avr_factor"] - right["avr_factor"]) > 1e-6:
+        return False
+    if left["sg_window"] != right["sg_window"] or left["sg_poly"] != right["sg_poly"]:
+        return False
+    if left["extension"] != right["extension"]:
+        return False
+    return left["area_left"] == right["area_left"] and left["area_right"] == right["area_right"]
 
 
 def load_tif_stack(path: str) -> np.ndarray:
@@ -289,11 +451,13 @@ class EditableROI:
         zorder: int = 5,
         sibling: "EditableROI | None" = None,
         enable_delete_key: bool = True,
+        on_press_intercept: Callable | None = None,
     ):
         self.ax = ax
         self.height, self.width = image_shape
         self.on_change = on_change
         self.on_mode_change = on_mode_change
+        self.on_press_intercept = on_press_intercept
         self.edge_color = edge_color
         self.fill_color = fill_color or edge_color
         self.fill_alpha = fill_alpha
@@ -535,6 +699,9 @@ class EditableROI:
         if event.button != 1:
             return
 
+        if self.on_press_intercept is not None and self.on_press_intercept(event):
+            return
+
         xy = self._event_xy(event) if event.inaxes is self.ax else None
         if xy is None:
             return
@@ -656,6 +823,12 @@ class StackAnalyzerApp:
         self._heatmap_pending = False
         self._heatmap_pending_full = False
         self._block_area_slider_callbacks = False
+        self.quant_pickle_path: Path | None = None
+        self.show_saved_rois = False
+        self._saved_roi_overlays: list[tuple[Polygon, int]] = []
+        self._active_saved_roi_row_index: int | None = None
+        self._loading_saved_roi = False
+        self._applying_quant_settings = False
 
         self.fig = plt.figure(figsize=(16, 9))
         self.fig.canvas.manager.set_window_title("Stack Analyzer")
@@ -670,12 +843,16 @@ class StackAnalyzerApp:
         )
         gs.update(top=0.82, bottom=0.06, left=0.05, right=0.98)
 
-        left_gs = gs[1:4, 0].subgridspec(2, 1, height_ratios=[0.90, 0.10], hspace=0.08)
+        left_gs = gs[1:4, 0].subgridspec(3, 1, height_ratios=[0.86, 0.07, 0.07], hspace=0.06)
         image_row_gs = left_gs[0, 0].subgridspec(1, 2, width_ratios=[1, 0.06], wspace=0.05)
         self.ax_image = self.fig.add_subplot(image_row_gs[0, 0])
         self.ax_heatmap_cbar = self.fig.add_subplot(image_row_gs[0, 1])
         self.ax_heatmap_cbar.set_axis_off()
-        toggle_ax = self.fig.add_subplot(left_gs[1, 0])
+        show_rois_ax = self.fig.add_subplot(left_gs[1, 0])
+        show_rois_ax.set_axis_off()
+        self.check_show_rois = widgets.CheckButtons(show_rois_ax, ["show ROIs"], [False])
+        self.check_show_rois.on_clicked(self._on_show_rois_toggled)
+        toggle_ax = self.fig.add_subplot(left_gs[2, 0])
         toggle_ax.set_axis_off()
         self.check_heatmap = widgets.CheckButtons(toggle_ax, ["Heatmap"], [False])
         self.check_heatmap.on_clicked(self._on_heatmap_toggled)
@@ -715,6 +892,10 @@ class StackAnalyzerApp:
         ax_clear_bg = self.fig.add_axes([0.14, 0.815, 0.08, 0.035])
         self.btn_clear_bg = widgets.Button(ax_clear_bg, "Clear BG")
         self.btn_clear_bg.on_clicked(lambda _event: self._clear_bg_roi())
+
+        ax_save_roi = self.fig.add_axes([0.05, 0.775, 0.17, 0.035])
+        self.btn_save_roi = widgets.Button(ax_save_roi, "Save ROI")
+        self.btn_save_roi.on_clicked(self._on_save_roi)
 
         ax_window = self.fig.add_axes([0.30, 0.905, 0.18, 0.025])
         self.slider_window = widgets.Slider(ax_window, "SG window", 3, 501, valinit=51, valstep=2)
@@ -791,6 +972,15 @@ class StackAnalyzerApp:
         if self.bg_roi_tool is not None and self.bg_roi_tool.draw_mode:
             self.bg_roi_tool.set_draw_mode(False)
             self._sync_bg_draw_button()
+        enabling = not self.roi_tool.draw_mode
+        if enabling:
+            self._active_saved_roi_row_index = None
+            self.roi_tool.vertices = None
+            self.roi_tool.mask = None
+            self.roi_tool._purge_display()
+            self.roi_tool._update_handles()
+            if self.show_saved_rois:
+                self._update_saved_roi_display()
         self.roi_tool.set_draw_mode(not self.roi_tool.draw_mode)
         self._sync_draw_button()
 
@@ -807,11 +997,320 @@ class StackAnalyzerApp:
         self.heatmap_enabled = bool(self.check_heatmap.get_status()[0])
         self._update_heatmap_display()
 
+    def _on_show_rois_toggled(self, _label: str) -> None:
+        self.show_saved_rois = bool(self.check_show_rois.get_status()[0])
+        if not self.show_saved_rois:
+            self._deselect_saved_roi(clear_traces=False)
+        self._update_saved_roi_display()
+
+    def _clear_saved_roi_overlays(self) -> None:
+        for patch, _row_idx in self._saved_roi_overlays:
+            try:
+                patch.remove()
+            except (ValueError, AttributeError):
+                pass
+        self._saved_roi_overlays = []
+
+    def _saved_roi_entries_for_current_stack(self) -> list[tuple[int, dict]]:
+        if self.stack is None or self.quant_pickle_path is None or not self.file_path:
+            return []
+
+        store = load_quant_store(self.quant_pickle_path)
+        current_dir = os.path.dirname(os.path.abspath(self.file_path))
+        current_size = format_stack_size(
+            self.stack.shape[2], self.stack.shape[1], self.stack.shape[0]
+        )
+        entries: list[tuple[int, dict]] = []
+        for row_index, row in enumerate(store.get("rows", [])):
+            if row.get("directory") != current_dir:
+                continue
+            if row.get("size") != current_size:
+                continue
+            entries.append((row_index, row))
+        return entries
+
+    def _hit_test_saved_roi(self, x: float, y: float) -> int | None:
+        for _patch, row_index in reversed(self._saved_roi_overlays):
+            if row_index == self._active_saved_roi_row_index:
+                continue
+            store = load_quant_store(self.quant_pickle_path)
+            row = store["rows"][row_index]
+            vertices = row.get("ROI pixels")
+            if vertices is None:
+                continue
+            verts = np.asarray(vertices, dtype=float)
+            if verts.ndim != 2 or len(verts) < 3:
+                continue
+            if MplPath(verts).contains_point((x, y), radius=2.0):
+                return row_index
+        return None
+
+    def _saved_roi_press_intercept(self, event) -> bool:
+        if not self.show_saved_rois or event.inaxes is not self.ax_image:
+            return False
+        if event.xdata is None or event.ydata is None:
+            return False
+
+        x, y = float(event.xdata), float(event.ydata)
+        row_index = self._hit_test_saved_roi(x, y)
+        if row_index is not None:
+            self._activate_saved_roi(row_index)
+            return True
+
+        if self.roi_tool is not None and self.roi_tool.vertices is not None:
+            if self.roi_tool._contains_point(x, y):
+                return False
+            if self.roi_tool._nearest_vertex(x, y) is not None:
+                return False
+
+        if self._active_saved_roi_row_index is not None or (
+            self.roi_tool is not None and self.roi_tool.vertices is not None
+        ):
+            if not (self.roi_tool is not None and self.roi_tool.draw_mode):
+                self._deselect_saved_roi()
+                return True
+        return False
+
+    def _current_quant_settings(self) -> dict:
+        f_left = int(self.slider_area_left.val)
+        f_right = int(self.slider_area_right.val)
+        if f_right < f_left:
+            f_left, f_right = f_right, f_left
+        return {
+            "starts": format_start_frames(self.start_frames),
+            "acq_fps": self.acq_fps,
+            "avr_factor": self.avr_factor,
+            "sg_window": int(self.slider_window.val),
+            "sg_poly": int(self.slider_poly.val),
+            "extension": int(self.slider_extension.val),
+            "area_left": f_left,
+            "area_right": f_right,
+        }
+
+    def _ask_quant_settings_choice(self, pickle_settings: dict, current_settings: dict) -> str | None:
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+
+        message = (
+            "The analysis settings in the pickle file differ from the current GUI.\n\n"
+            f"Pickle: starts={pickle_settings['starts']}, "
+            f"{format_freq_avr_field(pickle_settings['acq_fps'], pickle_settings['avr_factor'])}, "
+            f"SG={format_sg_field(pickle_settings['sg_window'], pickle_settings['sg_poly'])}, "
+            f"extension={pickle_settings['extension']}, "
+            f"Area L+R={format_area_lr_field(pickle_settings['area_left'], pickle_settings['area_right'])}\n\n"
+            f"Current: starts={current_settings['starts']}, "
+            f"{format_freq_avr_field(current_settings['acq_fps'], current_settings['avr_factor'])}, "
+            f"SG={format_sg_field(current_settings['sg_window'], current_settings['sg_poly'])}, "
+            f"extension={current_settings['extension']}, "
+            f"Area L+R={format_area_lr_field(current_settings['area_left'], current_settings['area_right'])}\n\n"
+            "Which settings should be used for all rows in the pickle file?"
+        )
+
+        choice: dict[str, str | None] = {"value": None}
+
+        dialog = tk.Toplevel(root)
+        dialog.title("Analysis settings differ")
+        dialog.attributes("-topmost", True)
+        dialog.grab_set()
+        tk.Label(dialog, text=message, justify="left", wraplength=520, padx=12, pady=12).pack()
+        button_row = tk.Frame(dialog, padx=12, pady=8)
+        button_row.pack()
+
+        def choose(value: str) -> None:
+            choice["value"] = value
+            dialog.destroy()
+            root.destroy()
+
+        tk.Button(
+            button_row,
+            text="Use pickle settings",
+            width=20,
+            command=lambda: choose("pickle"),
+        ).pack(side="left", padx=4)
+        tk.Button(
+            button_row,
+            text="Use current GUI settings",
+            width=20,
+            command=lambda: choose("current"),
+        ).pack(side="left", padx=4)
+        tk.Button(button_row, text="Cancel", width=10, command=lambda: choose(None)).pack(
+            side="left", padx=4
+        )
+        dialog.protocol("WM_DELETE_WINDOW", lambda: choose(None))
+        root.wait_window(dialog)
+        return choice["value"]
+
+    def _apply_quant_settings_to_gui(self, settings: dict) -> None:
+        self._applying_quant_settings = True
+        self.acq_fps = settings["acq_fps"]
+        self.avr_factor = settings["avr_factor"]
+        self.text_freq.set_val(str(settings["acq_fps"]))
+        self.text_avr.set_val(
+            str(int(settings["avr_factor"]))
+            if float(settings["avr_factor"]).is_integer()
+            else str(settings["avr_factor"])
+        )
+        self._update_effective_fps_display()
+        self.slider_window.set_val(settings["sg_window"])
+        self.slider_poly.set_val(settings["sg_poly"])
+        self.slider_extension.set_val(settings["extension"])
+        self.start_frames = parse_start_frames(settings["starts"], self.n_frames)
+        self._sync_starts_textbox_from_frames(self.start_frames)
+        self._block_area_slider_callbacks = True
+        try:
+            self.slider_area_left.set_val(settings["area_left"])
+            self.slider_area_right.set_val(settings["area_right"])
+        finally:
+            self._block_area_slider_callbacks = False
+        self._applying_quant_settings = False
+        self._update_analysis()
+
+    def _apply_quant_settings_to_all_rows(self, settings: dict) -> None:
+        if self.quant_pickle_path is None:
+            return
+        store = load_quant_store(self.quant_pickle_path)
+        fields = quant_settings_to_row_fields(settings)
+        for row in store["rows"]:
+            row.update(fields)
+        save_quant_store(self.quant_pickle_path, store)
+
+    def _resolve_quant_settings_conflict(self, row: dict) -> bool:
+        if self._applying_quant_settings:
+            return True
+        pickle_settings = quant_settings_from_row(row)
+        current_settings = self._current_quant_settings()
+        if quant_settings_equal(pickle_settings, current_settings):
+            return True
+
+        choice = self._ask_quant_settings_choice(pickle_settings, current_settings)
+        if choice is None:
+            return False
+        chosen = pickle_settings if choice == "pickle" else current_settings
+        self._apply_quant_settings_to_all_rows(chosen)
+        self._apply_quant_settings_to_gui(chosen)
+        return True
+
+    def _load_vertices_into_roi_tool(self, vertices: np.ndarray) -> None:
+        if self.roi_tool is None:
+            return
+        verts = clip_vertices(np.asarray(vertices, dtype=float), self.roi_tool.width, self.roi_tool.height)
+        self.roi_tool.vertices = verts
+        self.roi_tool.mask = polygon_mask(verts, self.roi_tool.height, self.roi_tool.width)
+        self.roi_tool.draw_mode = False
+        self.roi_tool._notify_mode_change()
+        self.roi_tool._update_patch()
+
+    def _load_bg_from_row(self, row: dict) -> None:
+        if self.bg_roi_tool is None:
+            return
+        bg_vertices = row.get("BG pixels")
+        if bg_vertices is None:
+            self.bg_roi_tool.clear()
+            self.raw_bg_trace = None
+            return
+        verts = clip_vertices(
+            np.asarray(bg_vertices, dtype=float),
+            self.bg_roi_tool.width,
+            self.bg_roi_tool.height,
+        )
+        self.bg_roi_tool.vertices = verts
+        self.bg_roi_tool.mask = polygon_mask(verts, self.bg_roi_tool.height, self.bg_roi_tool.width)
+        self.bg_roi_tool.draw_mode = False
+        self.bg_roi_tool._notify_mode_change()
+        self.bg_roi_tool._update_patch()
+        if self.stack is not None:
+            self.raw_bg_trace = compute_raw_trace(self.stack, self.bg_roi_tool.mask)
+
+    def _activate_saved_roi(self, row_index: int) -> None:
+        if self.quant_pickle_path is None or self.stack is None or self.roi_tool is None:
+            return
+
+        store = load_quant_store(self.quant_pickle_path)
+        if row_index < 0 or row_index >= len(store["rows"]):
+            return
+        row = store["rows"][row_index]
+        if not self._resolve_quant_settings_conflict(row):
+            return
+
+        self._loading_saved_roi = True
+        try:
+            self._active_saved_roi_row_index = row_index
+            self._load_vertices_into_roi_tool(np.asarray(row["ROI pixels"], dtype=float))
+            self._load_bg_from_row(row)
+            self._on_roi_changed()
+            self._update_saved_roi_display()
+        finally:
+            self._loading_saved_roi = False
+
+    def _deselect_saved_roi(self, *, clear_traces: bool = True) -> None:
+        self._active_saved_roi_row_index = None
+        if self.roi_tool is not None:
+            self.roi_tool.set_draw_mode(False)
+            self._sync_draw_button()
+            self.roi_tool.vertices = None
+            self.roi_tool.mask = None
+            self.roi_tool._purge_display()
+            self.roi_tool._update_handles()
+        if clear_traces:
+            self.raw_trace = None
+            self._update_roi_traces()
+
+    def _sync_active_quant_row(self) -> None:
+        if (
+            self._active_saved_roi_row_index is None
+            or self.quant_pickle_path is None
+            or self.roi_tool is None
+            or self.roi_tool.vertices is None
+        ):
+            return
+        store = load_quant_store(self.quant_pickle_path)
+        row_index = self._active_saved_roi_row_index
+        if row_index < 0 or row_index >= len(store["rows"]):
+            return
+        store["rows"][row_index] = self._build_quant_row()
+        save_quant_store(self.quant_pickle_path, store)
+
+    def _update_saved_roi_display(self) -> None:
+        self._clear_saved_roi_overlays()
+        if not self.show_saved_rois or self.stack is None:
+            self.fig.canvas.draw_idle()
+            return
+
+        for display_idx, (row_index, row) in enumerate(self._saved_roi_entries_for_current_stack()):
+            if row_index == self._active_saved_roi_row_index:
+                continue
+            vertices = row.get("ROI pixels")
+            if vertices is None:
+                continue
+            verts = np.asarray(vertices, dtype=float)
+            if verts.ndim != 2 or len(verts) < 3:
+                continue
+
+            color = SEGMENT_COLORS[display_idx % len(SEGMENT_COLORS)]
+            patch = Polygon(
+                verts,
+                closed=True,
+                fill=False,
+                edgecolor=color,
+                linewidth=1.8,
+                linestyle="-",
+                zorder=3,
+                alpha=0.95,
+            )
+            self.ax_image.add_patch(patch)
+            self._saved_roi_overlays.append((patch, row_index))
+
+        self.fig.canvas.draw_idle()
+
     def _on_area_slider_changed(self) -> None:
         if self._block_area_slider_callbacks:
             return
         self.area_map_cache = None
         self._update_plots()
+        if self._active_saved_roi_row_index is not None:
+            self._apply_quant_settings_to_all_rows(self._current_quant_settings())
+            self._sync_active_quant_row()
         if self.heatmap_enabled:
             self._update_heatmap_display(integrate_only=True)
 
@@ -836,9 +1335,12 @@ class StackAnalyzerApp:
         self._sync_bg_draw_button()
 
     def _clear_roi(self) -> None:
+        self._active_saved_roi_row_index = None
         if self.roi_tool is not None:
             self.roi_tool.clear()
-            self.fig.canvas.draw_idle()
+        if self.show_saved_rois:
+            self._update_saved_roi_display()
+        self.fig.canvas.draw_idle()
 
     def _clear_bg_roi(self) -> None:
         if self.bg_roi_tool is not None:
@@ -846,6 +1348,79 @@ class StackAnalyzerApp:
         self.raw_bg_trace = None
         self._update_roi_traces()
         self.fig.canvas.draw_idle()
+
+    def _on_save_roi(self, _event) -> None:
+        if self.stack is None or self.quant_pickle_path is None:
+            self._set_status_message("Cannot save ROI: no stack loaded.")
+            return
+        if self.roi_tool is None or self.roi_tool.vertices is None or len(self.roi_tool.vertices) < 3:
+            self._set_status_message("Cannot save ROI: draw a signal ROI first.")
+            return
+        if self.raw_trace is None:
+            self._set_status_message("Cannot save ROI: ROI trace is not available.")
+            return
+
+        store = load_quant_store(self.quant_pickle_path)
+        self._apply_quant_settings_to_all_rows(self._current_quant_settings())
+        if self._active_saved_roi_row_index is not None:
+            row_index = self._active_saved_roi_row_index
+            store["rows"][row_index] = self._build_quant_row()
+            message = (
+                f"ROI updated in {self.quant_pickle_path.name} "
+                f"(row {row_index + 1} of {len(store['rows'])})."
+            )
+        else:
+            store["rows"].append(self._build_quant_row())
+            message = (
+                f"ROI saved to {self.quant_pickle_path.name} "
+                f"({len(store['rows'])} rows total)."
+            )
+        save_quant_store(self.quant_pickle_path, store)
+        self._set_status_message(message)
+        if self.show_saved_rois:
+            self._update_saved_roi_display()
+
+    def _set_status_message(self, message: str) -> None:
+        self.file_text.set_text(message)
+        self.fig.canvas.draw_idle()
+
+    def _build_quant_row(self) -> dict:
+        width = self.stack.shape[2]
+        height = self.stack.shape[1]
+        f_left = int(self.slider_area_left.val)
+        f_right = int(self.slider_area_right.val)
+        if f_right < f_left:
+            f_left, f_right = f_right, f_left
+
+        bg_vertices = None
+        if self.bg_roi_tool is not None and self.bg_roi_tool.vertices is not None:
+            bg_vertices = np.asarray(self.bg_roi_tool.vertices, dtype=np.float64)
+
+        roi_vertices = np.asarray(self.roi_tool.vertices, dtype=np.float64)
+        max_vals: list[float] = []
+        if self.normalized_segments and self.rel_x is not None:
+            max_vals = compute_max_vals_per_segment(
+                self.normalized_segments, self.rel_x, f_left, f_right
+            )
+
+        return {
+            "directory": os.path.dirname(os.path.abspath(self.file_path)),
+            "size": format_stack_size(width, height, self.n_frames),
+            "starts": format_start_frames(self.start_frames),
+            "freq + avr": format_freq_avr_field(self.acq_fps, self.avr_factor),
+            "SG window and order": format_sg_field(
+                int(self.slider_window.val), int(self.slider_poly.val)
+            ),
+            "extension": str(int(self.slider_extension.val)),
+            "Area L+R": format_area_lr_field(f_left, f_right),
+            "BG pixels": bg_vertices,
+            "BG trc": None if self.raw_bg_trace is None else np.asarray(self.raw_bg_trace),
+            "ROI pixels": roi_vertices,
+            "ROI trc": np.asarray(self.raw_trace),
+            "Area": self._compute_area(f_left, f_right),
+            "max vals": np.asarray(max_vals, dtype=np.float64) if max_vals else np.array([]),
+            "bleach correct": None,
+        }
 
     def _on_starts_changed(self, text: str) -> None:
         self.starts_text = text
@@ -958,6 +1533,7 @@ class StackAnalyzerApp:
 
         self.stack = stack
         self.file_path = path
+        self.quant_pickle_path = ensure_quant_pickle(path)
         self.n_frames = stack.shape[0]
         self.z_average = compute_z_average(stack)
         self._heatmap_traces_dirty = True
@@ -966,6 +1542,7 @@ class StackAnalyzerApp:
         self.area_map_cache = None
 
         height, width = self.z_average.shape
+        self._active_saved_roi_row_index = None
         self._refresh_base_image()
 
         self.roi_tool = EditableROI(
@@ -975,6 +1552,7 @@ class StackAnalyzerApp:
             on_mode_change=self._on_roi_mode_changed,
             edge_color="lime",
             zorder=5,
+            on_press_intercept=self._saved_roi_press_intercept,
         )
         self.bg_roi_tool = EditableROI(
             self.ax_image,
@@ -1005,6 +1583,8 @@ class StackAnalyzerApp:
         self.file_text.set_text(f"{name}  |  {self.n_frames} frames, {height}×{width}")
 
         self._update_analysis()
+        if self.show_saved_rois:
+            self._update_saved_roi_display()
 
     def _mark_heatmap_dirty(self) -> None:
         self._heatmap_traces_dirty = True
@@ -1034,6 +1614,8 @@ class StackAnalyzerApp:
         self.ax_image.set_xlim(0, width)
         self.ax_image.set_ylim(height, 0)
         self._redraw_rois()
+        if self.show_saved_rois:
+            self._update_saved_roi_display()
 
     def _redraw_rois(self) -> None:
         for tool in (self.roi_tool, self.bg_roi_tool):
@@ -1338,7 +1920,14 @@ class StackAnalyzerApp:
         if self.stack is None or self.roi_tool is None:
             return
         self.raw_trace = compute_raw_trace(self.stack, self.roi_tool.mask)
+        if not self._loading_saved_roi and self.roi_tool.vertices is None:
+            self._active_saved_roi_row_index = None
         self._update_roi_traces()
+        if self._active_saved_roi_row_index is not None and not self._loading_saved_roi:
+            self._apply_quant_settings_to_all_rows(self._current_quant_settings())
+            self._sync_active_quant_row()
+        if self.show_saved_rois:
+            self._update_saved_roi_display()
 
     def _on_bg_changed(self) -> None:
         if self.stack is None or self.bg_roi_tool is None:
@@ -1353,6 +1942,9 @@ class StackAnalyzerApp:
                 self.bg_roi_tool._update_handles()
         else:
             self.raw_bg_trace = compute_raw_trace(self.stack, mask)
+        if self._active_saved_roi_row_index is not None and not self._loading_saved_roi:
+            self._apply_quant_settings_to_all_rows(self._current_quant_settings())
+            self._sync_active_quant_row()
         self._update_roi_traces()
 
     def _corrected_smooth_trace(self) -> np.ndarray | None:
