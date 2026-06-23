@@ -19,6 +19,7 @@ import tifffile
 from matplotlib.path import Path as MplPath
 from matplotlib.patches import Polygon, Rectangle
 from scipy.integrate import trapezoid
+from scipy.optimize import curve_fit
 from scipy.signal import savgol_filter
 
 SEGMENT_COLORS = plt.cm.tab10.colors
@@ -46,6 +47,7 @@ QUANT_COLUMNS = [
     "Area",
     "max vals",
     "bleach correct",
+    "BC baseline",
 ]
 
 
@@ -64,8 +66,11 @@ def load_quant_store(path: Path) -> dict:
         data = pickle.load(handle)
     if not isinstance(data, dict) or "rows" not in data:
         return empty_quant_store()
-    if "columns" not in data:
-        data["columns"] = QUANT_COLUMNS
+    data["columns"] = list(QUANT_COLUMNS)
+    for row in data.get("rows", []):
+        for column in QUANT_COLUMNS:
+            if column not in row:
+                row[column] = None
     return data
 
 
@@ -190,6 +195,140 @@ def quant_settings_equal(left: dict, right: dict) -> bool:
     return left["area_left"] == right["area_left"] and left["area_right"] == right["area_right"]
 
 
+TRACE_SUMMARY_COLUMNS = frozenset(
+    {"BG trc", "ROI trc", "bleach correct", "BC baseline"}
+)
+
+
+def biexponential_decay(t: np.ndarray, a1: float, tau1: float, a2: float, tau2: float, c: float) -> np.ndarray:
+    return a1 * np.exp(-t / tau1) + a2 * np.exp(-t / tau2) + c
+
+
+def compute_bg_corrected_smooth_trace(
+    roi_trace: np.ndarray,
+    bg_trace: np.ndarray,
+    sg_window: int,
+    sg_poly: int,
+) -> np.ndarray:
+    roi = np.asarray(roi_trace, dtype=np.float64)
+    bg = np.asarray(bg_trace, dtype=np.float64)
+    length = min(len(roi), len(bg))
+    roi = roi[:length]
+    bg = bg[:length]
+    smooth_roi = apply_savgol(roi, sg_window, sg_poly)
+    smooth_bg = apply_savgol(bg, sg_window, sg_poly)
+    return smooth_roi - smooth_bg
+
+
+def fit_biexponential_bleach_correct(signal: np.ndarray) -> np.ndarray | None:
+    """Fit f(t) = A1*exp(-t/tau1) + A2*exp(-t/tau2) + C to the full trace."""
+    values = np.asarray(signal, dtype=np.float64)
+    if values.ndim != 1 or values.size < 6:
+        return None
+    if not np.all(np.isfinite(values)):
+        return None
+
+    t = np.arange(values.size, dtype=np.float64)
+    tail = float(values[-1])
+    head = float(values[0])
+    amplitude = head - tail
+    if abs(amplitude) < 1e-12:
+        amplitude = float(np.ptp(values)) or 1.0
+    span = max(float(values.size), 1.0)
+    initial = [
+        amplitude * 0.6,
+        max(span / 10.0, 1.0),
+        amplitude * 0.4,
+        max(span / 2.0, 1.0),
+        tail,
+    ]
+
+    try:
+        params, _ = curve_fit(
+            biexponential_decay,
+            t,
+            values,
+            p0=initial,
+            maxfev=50_000,
+        )
+    except (RuntimeError, ValueError, TypeError):
+        return None
+
+    fitted = biexponential_decay(t, *params)
+    if not np.all(np.isfinite(fitted)):
+        return None
+    return fitted.astype(np.float64)
+
+
+def compute_bc_baseline_trace(
+    bleach_correct: np.ndarray,
+    bg_corrected_smooth: np.ndarray,
+    below_fraction: float = 0.10,
+) -> np.ndarray:
+    """Parallel-shift bleach-correct down so `below_fraction` of smooth values lie below it."""
+    bleach = np.asarray(bleach_correct, dtype=np.float64)
+    smooth = np.asarray(bg_corrected_smooth, dtype=np.float64)
+    length = min(len(bleach), len(smooth))
+    bleach = bleach[:length]
+    smooth = smooth[:length]
+    gap = bleach - smooth
+    percentile = min(max((1.0 - below_fraction) * 100.0, 0.0), 100.0)
+    shift = float(np.percentile(gap, percentile))
+    return (bleach - shift).astype(np.float64)
+
+
+def row_needs_bleach_update(row: dict) -> bool:
+    if row.get("BG trc") is None:
+        return False
+    for column in ("bleach correct", "BC baseline"):
+        value = row.get(column)
+        if value is None:
+            return True
+        if isinstance(value, np.ndarray) and value.size == 0:
+            return True
+    return False
+
+
+def update_row_bleach_correction(row: dict) -> bool:
+    """Compute bleach correct and BC baseline for one pickle row. Returns True if filled."""
+    bg_trace = row.get("BG trc")
+    roi_trace = row.get("ROI trc")
+    if bg_trace is None or roi_trace is None:
+        row["bleach correct"] = None
+        row["BC baseline"] = None
+        return False
+
+    try:
+        sg_window, sg_poly = parse_sg_field(row["SG window and order"])
+    except (ValueError, KeyError, TypeError):
+        row["bleach correct"] = None
+        row["BC baseline"] = None
+        return False
+
+    smooth = compute_bg_corrected_smooth_trace(roi_trace, bg_trace, sg_window, sg_poly)
+    bleach_correct = fit_biexponential_bleach_correct(smooth)
+    if bleach_correct is None:
+        row["bleach correct"] = None
+        row["BC baseline"] = None
+        return False
+
+    bc_baseline = compute_bc_baseline_trace(bleach_correct, smooth)
+    row["bleach correct"] = bleach_correct
+    row["BC baseline"] = bc_baseline
+    return True
+
+
+def backfill_bleach_correction(store: dict) -> bool:
+    """Fill missing bleach fields for rows that have a BG trace. Returns True if any row changed."""
+    changed = False
+    for row in store.get("rows", []):
+        if not row_needs_bleach_update(row):
+            continue
+        if update_row_bleach_correction(row):
+            changed = True
+    return changed
+
+
 def summarize_quant_cell(column: str, value) -> str:
     """Short one-line value for the pickle inspector table."""
     if value is None:
@@ -200,7 +339,7 @@ def summarize_quant_cell(column: str, value) -> str:
         if value.ndim == 2 and value.shape[1] == 2:
             return f"{value.shape[0]} vertices"
         if value.ndim == 1:
-            if column.endswith("trc"):
+            if column.endswith("trc") or column in TRACE_SUMMARY_COLUMNS:
                 vmin = float(np.nanmin(value))
                 vmax = float(np.nanmax(value))
                 return f"{value.size} pts ({vmin:.3g}…{vmax:.3g})"
@@ -225,7 +364,9 @@ def format_quant_value_detail(column: str, value) -> str:
             return "[]"
         if value.ndim == 2 and value.shape[1] == 2:
             return np.array2string(value, precision=2, separator=", ", max_line_width=100)
-        if value.ndim == 1 and value.size > 24 and column.endswith("trc"):
+        if value.ndim == 1 and value.size > 24 and (
+            column.endswith("trc") or column in TRACE_SUMMARY_COLUMNS
+        ):
             stats = (
                 f"length={value.size}, "
                 f"min={float(np.nanmin(value)):.6g}, "
@@ -316,7 +457,8 @@ def open_quant_pickle_inspector(path: Path) -> None:
         "ROI trc": 130,
         "Area": 90,
         "max vals": 120,
-        "bleach correct": 90,
+        "bleach correct": 130,
+        "BC baseline": 130,
     }
     for column in tree_columns:
         heading = "#" if column == "#" else column
@@ -979,6 +1121,7 @@ class StackAnalyzerApp:
         self.raw_trace: np.ndarray | None = None
         self.raw_bg_trace: np.ndarray | None = None
         self.smooth_trace: np.ndarray | None = None
+        self.bc_baseline_trace: np.ndarray | None = None
         self.file_path = initial_path or ""
 
         self.n_frames = 0
@@ -1082,9 +1225,13 @@ class StackAnalyzerApp:
         self.btn_clear_bg = widgets.Button(ax_clear_bg, "Clear BG")
         self.btn_clear_bg.on_clicked(lambda _event: self._clear_bg_roi())
 
-        ax_save_roi = self.fig.add_axes([0.05, 0.775, 0.17, 0.035])
+        ax_save_roi = self.fig.add_axes([0.05, 0.775, 0.08, 0.035])
         self.btn_save_roi = widgets.Button(ax_save_roi, "Save ROI")
         self.btn_save_roi.on_clicked(self._on_save_roi)
+
+        ax_delete_roi = self.fig.add_axes([0.14, 0.775, 0.08, 0.035])
+        self.btn_delete_roi = widgets.Button(ax_delete_roi, "Delete ROI")
+        self.btn_delete_roi.on_clicked(self._on_delete_roi)
 
         ax_window = self.fig.add_axes([0.30, 0.905, 0.18, 0.025])
         self.slider_window = widgets.Slider(ax_window, "SG window", 3, 501, valinit=51, valstep=2)
@@ -1499,7 +1646,9 @@ class StackAnalyzerApp:
         row_index = self._active_saved_roi_row_index
         if row_index < 0 or row_index >= len(store["rows"]):
             return
-        store["rows"][row_index] = self._build_quant_row()
+        store["rows"][row_index] = self._build_quant_row(
+            existing_row=store["rows"][row_index]
+        )
         save_quant_store(self.quant_pickle_path, store)
 
     def _update_saved_roi_display(self) -> None:
@@ -1595,13 +1744,13 @@ class StackAnalyzerApp:
         self._apply_quant_settings_to_all_rows(self._current_quant_settings())
         if self._active_saved_roi_row_index is not None:
             row_index = self._active_saved_roi_row_index
-            store["rows"][row_index] = self._build_quant_row()
+            store["rows"][row_index] = self._build_quant_row(recompute_bleach=True)
             message = (
                 f"ROI updated in {self.quant_pickle_path.name} "
                 f"(row {row_index + 1} of {len(store['rows'])})."
             )
         else:
-            store["rows"].append(self._build_quant_row())
+            store["rows"].append(self._build_quant_row(recompute_bleach=True))
             message = (
                 f"ROI saved to {self.quant_pickle_path.name} "
                 f"({len(store['rows'])} rows total)."
@@ -1611,11 +1760,53 @@ class StackAnalyzerApp:
         if self.show_saved_rois:
             self._update_saved_roi_display()
 
+    def _on_delete_roi(self, _event) -> None:
+        if self.stack is None or self.quant_pickle_path is None:
+            self._set_status_message("Cannot delete ROI: no stack loaded.")
+            return
+        if self._active_saved_roi_row_index is None:
+            self._set_status_message("Cannot delete ROI: select a saved ROI first.")
+            return
+
+        row_index = self._active_saved_roi_row_index
+        store = load_quant_store(self.quant_pickle_path)
+        if row_index < 0 or row_index >= len(store["rows"]):
+            self._active_saved_roi_row_index = None
+            self._set_status_message("Cannot delete ROI: row not found.")
+            return
+
+        if not messagebox.askyesno(
+            "Delete ROI",
+            f"Delete saved ROI row {row_index + 1} from {self.quant_pickle_path.name}?",
+        ):
+            return
+
+        del store["rows"][row_index]
+        save_quant_store(self.quant_pickle_path, store)
+
+        self._deselect_saved_roi(clear_traces=False)
+        if self.bg_roi_tool is not None:
+            self.bg_roi_tool.clear()
+            self._sync_bg_draw_button()
+        self.raw_bg_trace = None
+        self._update_roi_traces()
+        if self.show_saved_rois:
+            self._update_saved_roi_display()
+        self._set_status_message(
+            f"Deleted ROI row {row_index + 1} from {self.quant_pickle_path.name} "
+            f"({len(store['rows'])} rows remaining)."
+        )
+
     def _set_status_message(self, message: str) -> None:
         self.file_text.set_text(message)
         self.fig.canvas.draw_idle()
 
-    def _build_quant_row(self) -> dict:
+    def _build_quant_row(
+        self,
+        *,
+        recompute_bleach: bool = False,
+        existing_row: dict | None = None,
+    ) -> dict:
         width = self.stack.shape[2]
         height = self.stack.shape[1]
         f_left = int(self.slider_area_left.val)
@@ -1634,7 +1825,7 @@ class StackAnalyzerApp:
                 self.normalized_segments, self.rel_x, f_left, f_right
             )
 
-        return {
+        row = {
             "directory": os.path.dirname(os.path.abspath(self.file_path)),
             "size": format_stack_size(width, height, self.n_frames),
             "starts": format_start_frames(self.start_frames),
@@ -1651,7 +1842,14 @@ class StackAnalyzerApp:
             "Area": self._compute_area(f_left, f_right),
             "max vals": np.asarray(max_vals, dtype=np.float64) if max_vals else np.array([]),
             "bleach correct": None,
+            "BC baseline": None,
         }
+        if recompute_bleach:
+            update_row_bleach_correction(row)
+        elif existing_row is not None:
+            row["bleach correct"] = existing_row.get("bleach correct")
+            row["BC baseline"] = existing_row.get("BC baseline")
+        return row
 
     def _on_starts_changed(self, text: str) -> None:
         self.starts_text = text
@@ -2196,6 +2394,20 @@ class StackAnalyzerApp:
         smooth_bg = apply_savgol(self.raw_bg_trace, window, poly)
         return smooth_signal - smooth_bg
 
+    def _compute_bc_baseline_trace(self) -> np.ndarray | None:
+        if self.raw_trace is None or self.raw_bg_trace is None:
+            return None
+
+        window = int(self.slider_window.val)
+        poly = int(self.slider_poly.val)
+        smooth = compute_bg_corrected_smooth_trace(
+            self.raw_trace, self.raw_bg_trace, window, poly
+        )
+        bleach_correct = fit_biexponential_bleach_correct(smooth)
+        if bleach_correct is None:
+            return None
+        return compute_bc_baseline_trace(bleach_correct, smooth)
+
     def _update_roi_traces(self) -> None:
         """Refresh ROI-based traces/plots only; heatmap is full-image and unchanged."""
         if self.stack is None:
@@ -2204,6 +2416,7 @@ class StackAnalyzerApp:
         self.extension = int(self.slider_extension.val)
 
         self.smooth_trace = self._corrected_smooth_trace()
+        self.bc_baseline_trace = self._compute_bc_baseline_trace()
         self._compute_mean_trace()
         self._update_plots()
 
@@ -2263,7 +2476,17 @@ class StackAnalyzerApp:
 
         self.ax_smooth.clear()
         if self.smooth_trace is not None and n_frames:
-            self.ax_smooth.plot(x, self.smooth_trace, color="0.15", linewidth=1.0)
+            self.ax_smooth.plot(x, self.smooth_trace, color="0.15", linewidth=1.0, label="smoothed")
+            if self.bc_baseline_trace is not None:
+                bc_len = len(self.bc_baseline_trace)
+                self.ax_smooth.plot(
+                    x[:bc_len],
+                    self.bc_baseline_trace,
+                    color="red",
+                    linestyle=":",
+                    linewidth=1.2,
+                    label="BC baseline",
+                )
             extension = self.extension
             for idx, start in enumerate(self.start_frames):
                 if start + extension > n_frames:
@@ -2272,6 +2495,8 @@ class StackAnalyzerApp:
                 span_left = self._frame_to_axis(start, one_based=False)
                 span_right = self._frame_to_axis(start + extension, one_based=False)
                 self.ax_smooth.axvspan(span_left, span_right, color=color, alpha=0.18, lw=0)
+            if self.bc_baseline_trace is not None:
+                self.ax_smooth.legend(loc="upper right", fontsize=8)
         self.ax_smooth.set_ylabel("Intensity")
         title = "smoothed (ROI − BG)" if self.raw_bg_trace is not None else "smoothed"
         self.ax_smooth.set_title(title)
