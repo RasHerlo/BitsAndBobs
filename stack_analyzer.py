@@ -51,7 +51,10 @@ QUANT_COLUMNS = [
     "bleach correct",
     "BC baseline",
     "Man. Adj.",
+    "Marked events",
 ]
+
+MARKED_EVENTS_COLUMN = "Marked events"
 
 
 def quant_pickle_path_for_stack(stack_path: str) -> Path:
@@ -387,10 +390,87 @@ def compute_row_mark_event_traces(
     return smooth, adjusted_baseline, normalized
 
 
+def draw_row_event_spans(
+    ax,
+    row: dict,
+    n_frames: int,
+    frame_to_axis: Callable[[float], float],
+) -> None:
+    """Draw colored event brackets from a pickle row's starts and extension."""
+    try:
+        extension = int(float(row.get("extension", "50")))
+    except (TypeError, ValueError):
+        extension = 50
+    starts = parse_start_frames(str(row.get("starts", "")), n_frames)
+    for idx, start in enumerate(starts):
+        if start + extension > n_frames:
+            continue
+        color = SEGMENT_COLORS[idx % len(SEGMENT_COLORS)]
+        span_left = frame_to_axis(float(start))
+        span_right = frame_to_axis(float(start + extension))
+        ax.axvspan(span_left, span_right, color=color, alpha=0.18, lw=0)
+
+
+def parse_marked_events(value) -> list[tuple[int, int]]:
+    if value is None:
+        return []
+    if isinstance(value, np.ndarray):
+        arr = np.asarray(value)
+        if arr.size == 0:
+            return []
+        if arr.ndim == 1 and arr.size >= 2:
+            arr = arr.reshape(1, -1)
+        if arr.ndim == 2 and arr.shape[1] >= 2:
+            return _normalize_event_pairs([(int(r[0]), int(r[1])) for r in arr])
+        return []
+    if isinstance(value, list):
+        pairs: list[tuple[int, int]] = []
+        for item in value:
+            if isinstance(item, (list, tuple)) and len(item) >= 2:
+                pairs.append((int(item[0]), int(item[1])))
+        return _normalize_event_pairs(pairs)
+    return []
+
+
+def _normalize_event_pairs(pairs: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    normalized: list[tuple[int, int]] = []
+    for start, finish in pairs:
+        if finish < start:
+            start, finish = finish, start
+        normalized.append((start, finish))
+    return normalized
+
+
+def format_marked_events_for_storage(pairs: list[tuple[int, int]]) -> list[list[int]]:
+    return [[int(start), int(finish)] for start, finish in _normalize_event_pairs(pairs)]
+
+
+def draw_locked_marked_events(
+    ax,
+    row: dict,
+    n_frames: int,
+    frame_to_axis: Callable[[float], float],
+) -> None:
+    for start, finish in parse_marked_events(row.get(MARKED_EVENTS_COLUMN)):
+        if start >= n_frames:
+            continue
+        finish = min(finish, n_frames - 1)
+        span_left = frame_to_axis(float(start))
+        span_right = frame_to_axis(float(finish))
+        ax.axvspan(span_left, span_right, color="0.55", alpha=0.22, lw=0, zorder=2)
+
+
 def summarize_quant_cell(column: str, value) -> str:
     """Short one-line value for the pickle inspector table."""
     if value is None:
         return ""
+    if column == MARKED_EVENTS_COLUMN:
+        pairs = parse_marked_events(value)
+        if not pairs:
+            return ""
+        if len(pairs) <= 3:
+            return "; ".join(f"{start}-{finish}" for start, finish in pairs)
+        return f"{len(pairs)} events"
     if isinstance(value, np.ndarray):
         if value.size == 0:
             return "[]"
@@ -518,6 +598,7 @@ def open_quant_pickle_inspector(path: Path) -> None:
         "bleach correct": 130,
         "BC baseline": 130,
         "Man. Adj.": 70,
+        "Marked events": 120,
     }
     for column in tree_columns:
         heading = "#" if column == "#" else column
@@ -865,11 +946,18 @@ class MarkEventsWindow:
 
         self._man_adj_step = 1.0
         self._updating_man_adj_field = False
+        self._add_event_active = False
+        self._remove_event_active = False
+        self._draft_start: int | None = None
+        self._draft_finish: int | None = None
+        self._draft_phase = "idle"
+        self._dragging_boundary: str | None = None
+        self._canvas_cids: list[int] = []
 
         self.root = tk.Toplevel()
         self.root.title("Mark Events")
-        self.root.geometry("1220x760")
-        self.root.minsize(920, 580)
+        self.root.geometry("1240x760")
+        self.root.minsize(960, 580)
 
         top = tk.Frame(self.root, padx=8, pady=6)
         top.pack(fill="x")
@@ -897,8 +985,31 @@ class MarkEventsWindow:
             side="left"
         )
 
-        plot_frame = tk.Frame(self.root)
-        plot_frame.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+        content = tk.Frame(self.root)
+        content.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+
+        plot_frame = tk.Frame(content)
+        plot_frame.pack(side="left", fill="both", expand=True)
+
+        side_panel = tk.Frame(content, padx=8, pady=8)
+        side_panel.pack(side="right", fill="y")
+        self.btn_add_event = tk.Button(
+            side_panel, text="Add Event", width=12, command=self._on_add_event
+        )
+        self.btn_add_event.pack(pady=(0, 6))
+        self.btn_lock_event = tk.Button(
+            side_panel, text="Lock Event", width=12, command=self._on_lock_event
+        )
+        self.btn_lock_event.pack(pady=(0, 6))
+        self.btn_remove_event = tk.Button(
+            side_panel, text="Remove Event", width=12, command=self._on_remove_event
+        )
+        self.btn_remove_event.pack()
+        self.event_status_label = tk.Label(
+            side_panel, text="", wraplength=120, justify="left", anchor="w"
+        )
+        self.event_status_label.pack(pady=(12, 0), fill="x")
+
         self.fig = Figure(figsize=(12.0, 7.0), dpi=100)
         grid = self.fig.add_gridspec(1, 2, width_ratios=[1.05, 1.0], wspace=0.28)
         self.ax_image = self.fig.add_subplot(grid[0, 0])
@@ -908,13 +1019,258 @@ class MarkEventsWindow:
 
         self.canvas = FigureCanvasTkAgg(self.fig, master=plot_frame)
         self.canvas.get_tk_widget().pack(fill="both", expand=True)
+        self._connect_canvas_events()
 
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self._refresh_all()
 
     def _on_close(self) -> None:
+        for cid in self._canvas_cids:
+            try:
+                self.canvas.mpl_disconnect(cid)
+            except (ValueError, AttributeError):
+                pass
+        self._canvas_cids = []
         self.app._mark_events_window = None
         self.root.destroy()
+
+    def _connect_canvas_events(self) -> None:
+        self._canvas_cids = [
+            self.canvas.mpl_connect("button_press_event", self._on_canvas_press),
+            self.canvas.mpl_connect("motion_notify_event", self._on_canvas_motion),
+            self.canvas.mpl_connect("button_release_event", self._on_canvas_release),
+        ]
+
+    def _reset_event_modes(self) -> None:
+        self._add_event_active = False
+        self._remove_event_active = False
+        self._draft_start = None
+        self._draft_finish = None
+        self._draft_phase = "idle"
+        self._dragging_boundary = None
+        self._sync_add_event_button()
+        self._sync_remove_event_button()
+        self._set_event_status("")
+
+    def _set_event_status(self, message: str) -> None:
+        self.event_status_label.config(text=message)
+
+    def _sync_add_event_button(self) -> None:
+        label = "Add Event [ON]" if self._add_event_active else "Add Event"
+        self.btn_add_event.config(text=label)
+
+    def _sync_remove_event_button(self) -> None:
+        label = "Remove Event [ON]" if self._remove_event_active else "Remove Event"
+        self.btn_remove_event.config(text=label)
+
+    def _format_event_range(self, start: int, finish: int) -> str:
+        app = self.app
+        if app.convert_time_axis:
+            fps = app._effective_fps()
+            if fps > 0:
+                return f"{start / fps:.3f}–{finish / fps:.3f} s"
+        return f"{start}–{finish}"
+
+    def _pick_locked_event_index(self, xdata: float) -> int | None:
+        frame = self._clamp_frame(self._axis_to_frame(xdata))
+        pairs = parse_marked_events(self._current_row().get(MARKED_EVENTS_COLUMN))
+        for idx in range(len(pairs) - 1, -1, -1):
+            start, finish = pairs[idx]
+            if start <= frame <= finish:
+                return idx
+        return None
+
+    def _current_n_frames(self) -> int:
+        row = self._current_row()
+        roi_trace = row.get("ROI trc")
+        if roi_trace is not None:
+            return len(np.asarray(roi_trace))
+        return self.app.n_frames
+
+    def _clamp_frame(self, frame: int) -> int:
+        n_frames = self._current_n_frames()
+        if n_frames <= 0:
+            return 0
+        return int(np.clip(frame, 0, n_frames - 1))
+
+    def _axis_to_frame(self, axis_value: float) -> int:
+        app = self.app
+        if not app.convert_time_axis:
+            return int(round(axis_value))
+        fps = app._effective_fps()
+        if fps <= 0:
+            return int(round(axis_value))
+        return int(round(axis_value * fps))
+
+    def _axis_pick_tolerance(self, ax) -> float:
+        try:
+            bbox = ax.get_window_extent(self.canvas.get_renderer())
+        except (AttributeError, RuntimeError):
+            bbox = None
+        if bbox is None or bbox.width <= 0:
+            return 0.5
+        xlim = ax.get_xlim()
+        return abs(xlim[1] - xlim[0]) * (8.0 / bbox.width)
+
+    def _pick_boundary(self, xdata: float) -> str | None:
+        tol = self._axis_pick_tolerance(self.ax_lower)
+        app = self.app
+        if self._draft_start is not None:
+            x_start = app._frame_to_axis(float(self._draft_start), one_based=False)
+            if abs(xdata - x_start) <= tol:
+                return "start"
+        if self._draft_finish is not None:
+            x_finish = app._frame_to_axis(float(self._draft_finish), one_based=False)
+            if abs(xdata - x_finish) <= tol:
+                return "finish"
+        return None
+
+    def _on_add_event(self) -> None:
+        self._remove_event_active = False
+        self._sync_remove_event_button()
+        self._add_event_active = True
+        self._draft_start = None
+        self._draft_finish = None
+        self._draft_phase = "need_start"
+        self._dragging_boundary = None
+        self._sync_add_event_button()
+        self._set_event_status("Click the lower trace to set event start.")
+        self._draw_traces()
+
+    def _on_lock_event(self) -> None:
+        if self._draft_start is None or self._draft_finish is None:
+            messagebox.showinfo(
+                "Lock Event",
+                "Add an event first: set start and finish on the lower trace.",
+            )
+            return
+
+        start = self._clamp_frame(self._draft_start)
+        finish = self._clamp_frame(self._draft_finish)
+        if finish < start:
+            start, finish = finish, start
+
+        row_index = self._current_row_index()
+        pairs = parse_marked_events(self.store["rows"][row_index].get(MARKED_EVENTS_COLUMN))
+        pairs.append((start, finish))
+        self.store["rows"][row_index][MARKED_EVENTS_COLUMN] = format_marked_events_for_storage(
+            pairs
+        )
+        save_quant_store(self.app.quant_pickle_path, self.store)
+        self._reset_event_modes()
+        self._draw_traces()
+        self._set_event_status(f"Locked event {start}–{finish}.")
+
+    def _on_remove_event(self) -> None:
+        pairs = parse_marked_events(self._current_row().get(MARKED_EVENTS_COLUMN))
+        if not pairs:
+            messagebox.showinfo("Remove Event", "No locked events to remove for this row.")
+            return
+
+        self._reset_event_modes()
+        self._remove_event_active = True
+        self._sync_remove_event_button()
+        self._set_event_status("Click a grey event region on the lower trace to remove it.")
+        self._draw_traces()
+
+    def _remove_locked_event_at_index(self, event_index: int) -> None:
+        row_index = self._current_row_index()
+        pairs = parse_marked_events(self.store["rows"][row_index].get(MARKED_EVENTS_COLUMN))
+        if event_index < 0 or event_index >= len(pairs):
+            return
+
+        start, finish = pairs[event_index]
+        label = self._format_event_range(start, finish)
+        if not messagebox.askyesno("Remove Event", f"Delete locked event {label}?"):
+            return
+
+        pairs.pop(event_index)
+        self.store["rows"][row_index][MARKED_EVENTS_COLUMN] = format_marked_events_for_storage(
+            pairs
+        )
+        save_quant_store(self.app.quant_pickle_path, self.store)
+        self._draw_traces()
+        if pairs:
+            self._set_event_status(f"Removed event {label}. Click another grey region to remove.")
+        else:
+            self._remove_event_active = False
+            self._sync_remove_event_button()
+            self._set_event_status(f"Removed event {label}. No locked events remain.")
+
+    def _on_canvas_press(self, event) -> None:
+        if event.inaxes is not self.ax_lower or event.xdata is None:
+            return
+
+        xdata = float(event.xdata)
+
+        if self._remove_event_active:
+            event_index = self._pick_locked_event_index(xdata)
+            if event_index is not None:
+                self._remove_locked_event_at_index(event_index)
+            return
+
+        if self._draft_start is not None and self._draft_finish is not None:
+            boundary = self._pick_boundary(xdata)
+            if boundary is not None:
+                self._dragging_boundary = boundary
+                return
+
+        if not self._add_event_active:
+            return
+
+        frame = self._clamp_frame(self._axis_to_frame(xdata))
+        if self._draft_phase == "need_start":
+            self._draft_start = frame
+            self._draft_phase = "need_finish"
+            self._set_event_status("Click the lower trace to set event finish.")
+            self._draw_traces()
+        elif self._draft_phase == "need_finish":
+            self._draft_finish = frame
+            if self._draft_start is not None and self._draft_finish < self._draft_start:
+                self._draft_start, self._draft_finish = self._draft_finish, self._draft_start
+            self._draft_phase = "ready"
+            self._add_event_active = False
+            self._sync_add_event_button()
+            self._set_event_status("Adjust boundaries, then click Lock Event.")
+            self._draw_traces()
+
+    def _on_canvas_motion(self, event) -> None:
+        if self._dragging_boundary is None:
+            return
+        if event.inaxes is not self.ax_lower or event.xdata is None:
+            return
+
+        frame = self._clamp_frame(self._axis_to_frame(float(event.xdata)))
+        if self._dragging_boundary == "start":
+            if self._draft_finish is not None:
+                frame = min(frame, self._draft_finish)
+            self._draft_start = frame
+        elif self._dragging_boundary == "finish":
+            if self._draft_start is not None:
+                frame = max(frame, self._draft_start)
+            self._draft_finish = frame
+        self._draw_traces()
+
+    def _on_canvas_release(self, _event) -> None:
+        self._dragging_boundary = None
+
+    def _draw_draft_boundaries(self, n_frames: int, frame_to_axis: Callable[[float], float]) -> None:
+        if self._draft_start is not None:
+            self.ax_lower.axvline(
+                frame_to_axis(float(self._draft_start)),
+                color="black",
+                linestyle=":",
+                linewidth=1.5,
+                zorder=6,
+            )
+        if self._draft_finish is not None:
+            self.ax_lower.axvline(
+                frame_to_axis(float(self._draft_finish)),
+                color="black",
+                linestyle=":",
+                linewidth=1.5,
+                zorder=6,
+            )
 
     def _current_row_index(self) -> int:
         return self.entries[self.entry_pos][0]
@@ -973,6 +1329,7 @@ class MarkEventsWindow:
         save_quant_store(self.app.quant_pickle_path, self.store)
 
     def _refresh_all(self) -> None:
+        self._reset_event_modes()
         row = self._current_row()
         man_adj = parse_man_adj(row.get("Man. Adj."))
         self._updating_man_adj_field = True
@@ -1070,6 +1427,7 @@ class MarkEventsWindow:
 
         n_frames = len(smooth)
         x = app._frames_to_axis(np.arange(n_frames, dtype=float), one_based=False)
+        frame_to_axis = lambda frame: app._frame_to_axis(frame, one_based=False)
 
         self.ax_upper.plot(x, smooth, color="0.15", linewidth=1.0, label="smoothed")
         self.ax_upper.plot(
@@ -1080,17 +1438,23 @@ class MarkEventsWindow:
             linewidth=1.2,
             label="BC baseline",
         )
+        draw_row_event_spans(self.ax_upper, row, n_frames, frame_to_axis)
         self.ax_upper.legend(loc="upper right", fontsize=8)
         self.ax_upper.set_ylabel("Intensity")
         self.ax_upper.set_title(f"Row {row_index + 1}: smoothed BC-corrected")
         self.ax_upper.set_xlabel(xlabel)
 
-        self.ax_lower.plot(x, normalized, color="0.15", linewidth=1.0)
-        self.ax_lower.axhline(1.0, color="red", linestyle=":", linewidth=1.2, label="baseline (=1)")
+        self.ax_lower.plot(x, normalized, color="0.15", linewidth=1.0, zorder=3)
+        self.ax_lower.axhline(1.0, color="red", linestyle=":", linewidth=1.2, label="baseline (=1)", zorder=4)
+        draw_row_event_spans(self.ax_lower, row, n_frames, frame_to_axis)
+        draw_locked_marked_events(self.ax_lower, row, n_frames, frame_to_axis)
+        self._draw_draft_boundaries(n_frames, frame_to_axis)
         self.ax_lower.legend(loc="upper right", fontsize=8)
         self.ax_lower.set_ylabel("Normalized")
         self.ax_lower.set_title(f"Row {row_index + 1}: normalized to BC baseline")
         self.ax_lower.set_xlabel(xlabel)
+        self.ax_upper.set_xlim(x[0], x[-1])
+        self.ax_lower.set_xlim(x[0], x[-1])
         self.canvas.draw_idle()
 
 
