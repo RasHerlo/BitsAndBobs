@@ -9,7 +9,7 @@ import pickle
 import tkinter as tk
 from collections.abc import Callable
 from pathlib import Path
-from tkinter import filedialog
+from tkinter import filedialog, messagebox, ttk
 
 import matplotlib.pyplot as plt
 import matplotlib.widgets as widgets
@@ -188,6 +188,191 @@ def quant_settings_equal(left: dict, right: dict) -> bool:
     if left["extension"] != right["extension"]:
         return False
     return left["area_left"] == right["area_left"] and left["area_right"] == right["area_right"]
+
+
+def summarize_quant_cell(column: str, value) -> str:
+    """Short one-line value for the pickle inspector table."""
+    if value is None:
+        return ""
+    if isinstance(value, np.ndarray):
+        if value.size == 0:
+            return "[]"
+        if value.ndim == 2 and value.shape[1] == 2:
+            return f"{value.shape[0]} vertices"
+        if value.ndim == 1:
+            if column.endswith("trc"):
+                vmin = float(np.nanmin(value))
+                vmax = float(np.nanmax(value))
+                return f"{value.size} pts ({vmin:.3g}…{vmax:.3g})"
+            if column == "max vals":
+                if value.size <= 6:
+                    return np.array2string(value, precision=3, separator=", ")
+                return f"{value.size} values"
+            return f"array[{value.size}]"
+        return f"array{value.shape}"
+    text = str(value)
+    if column == "directory" and len(text) > 48:
+        return text[:45] + "…"
+    return text
+
+
+def format_quant_value_detail(column: str, value) -> str:
+    """Multi-line detail for one pickle row field."""
+    if value is None:
+        return "None"
+    if isinstance(value, np.ndarray):
+        if value.size == 0:
+            return "[]"
+        if value.ndim == 2 and value.shape[1] == 2:
+            return np.array2string(value, precision=2, separator=", ", max_line_width=100)
+        if value.ndim == 1 and value.size > 24 and column.endswith("trc"):
+            stats = (
+                f"length={value.size}, "
+                f"min={float(np.nanmin(value)):.6g}, "
+                f"max={float(np.nanmax(value)):.6g}, "
+                f"mean={float(np.nanmean(value)):.6g}"
+            )
+            head = np.array2string(value[:12], precision=4, separator=", ")
+            tail = np.array2string(value[-6:], precision=4, separator=", ")
+            return f"{stats}\n{head} … ({value.size} total) … {tail}"
+        return np.array2string(value, precision=4, separator=", ", max_line_width=100)
+    return str(value)
+
+
+def format_quant_row_detail(row: dict, row_index: int, columns: list[str]) -> str:
+    lines = [f"Row {row_index}"]
+    for column in columns:
+        if column not in row:
+            continue
+        lines.append(f"\n{column}:")
+        lines.append(format_quant_value_detail(column, row[column]))
+    return "\n".join(lines)
+
+
+def open_quant_pickle_inspector(path: Path) -> None:
+    """Open a scrollable overview of the ROI quantification pickle file."""
+    store = load_quant_store(path)
+    columns = list(store.get("columns", QUANT_COLUMNS))
+    rows = store.get("rows", [])
+    tree_columns = ["#"] + columns
+
+    root = tk.Tk()
+    root.withdraw()
+
+    window = tk.Toplevel(root)
+    window.title(f"Inspect Pickle — {path.name}")
+    window.geometry("1100x700")
+    window.minsize(640, 420)
+
+    header = tk.Frame(window, padx=10, pady=8)
+    header.pack(fill="x")
+    tk.Label(
+        header,
+        text=f"File: {path}",
+        anchor="w",
+        justify="left",
+        wraplength=1040,
+    ).pack(fill="x")
+    tk.Label(
+        header,
+        text=f"version={store.get('version', '?')}  |  {len(rows)} row(s)",
+        anchor="w",
+    ).pack(fill="x")
+
+    paned = tk.PanedWindow(window, orient="vertical", sashrelief="raised", sashwidth=4)
+    paned.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+
+    table_frame = tk.Frame(paned)
+    paned.add(table_frame, minsize=180)
+
+    table_scroll_y = ttk.Scrollbar(table_frame, orient="vertical")
+    table_scroll_x = ttk.Scrollbar(table_frame, orient="horizontal")
+    tree = ttk.Treeview(
+        table_frame,
+        columns=tree_columns,
+        show="headings",
+        yscrollcommand=table_scroll_y.set,
+        xscrollcommand=table_scroll_x.set,
+        selectmode="browse",
+    )
+    table_scroll_y.config(command=tree.yview)
+    table_scroll_x.config(command=tree.xview)
+    table_scroll_y.pack(side="right", fill="y")
+    table_scroll_x.pack(side="bottom", fill="x")
+    tree.pack(side="left", fill="both", expand=True)
+
+    default_widths = {
+        "#": 40,
+        "directory": 220,
+        "size": 110,
+        "starts": 150,
+        "freq + avr": 110,
+        "SG window and order": 120,
+        "extension": 70,
+        "Area L+R": 80,
+        "BG pixels": 90,
+        "BG trc": 130,
+        "ROI pixels": 90,
+        "ROI trc": 130,
+        "Area": 90,
+        "max vals": 120,
+        "bleach correct": 90,
+    }
+    for column in tree_columns:
+        heading = "#" if column == "#" else column
+        tree.heading(column, text=heading)
+        tree.column(column, width=default_widths.get(column, 100), minwidth=48, stretch=False)
+
+    detail_frame = tk.Frame(paned)
+    paned.add(detail_frame, minsize=140)
+    tk.Label(detail_frame, text="Row details", anchor="w").pack(fill="x", pady=(0, 4))
+    detail_outer = tk.Frame(detail_frame)
+    detail_outer.pack(fill="both", expand=True)
+    detail_scroll_y = ttk.Scrollbar(detail_outer, orient="vertical")
+    detail_scroll_x = ttk.Scrollbar(detail_outer, orient="horizontal")
+    detail_text = tk.Text(
+        detail_outer,
+        wrap="none",
+        font=("Consolas", 10),
+        yscrollcommand=detail_scroll_y.set,
+        xscrollcommand=detail_scroll_x.set,
+    )
+    detail_scroll_y.config(command=detail_text.yview)
+    detail_scroll_x.config(command=detail_text.xview)
+    detail_scroll_y.pack(side="right", fill="y")
+    detail_scroll_x.pack(side="bottom", fill="x")
+    detail_text.pack(side="left", fill="both", expand=True)
+    detail_text.config(state="disabled")
+
+    for row_index, row in enumerate(rows):
+        values = [str(row_index)]
+        for column in columns:
+            values.append(summarize_quant_cell(column, row.get(column)))
+        tree.insert("", "end", iid=str(row_index), values=values)
+
+    def show_row_detail(_event=None) -> None:
+        selection = tree.selection()
+        detail_text.config(state="normal")
+        detail_text.delete("1.0", "end")
+        if not selection:
+            detail_text.config(state="disabled")
+            return
+        row_index = int(selection[0])
+        if 0 <= row_index < len(rows):
+            detail_text.insert("1.0", format_quant_row_detail(rows[row_index], row_index, columns))
+        detail_text.config(state="disabled")
+
+    tree.bind("<<TreeviewSelect>>", show_row_detail)
+    if rows:
+        tree.selection_set("0")
+        tree.focus("0")
+        show_row_detail()
+
+    def on_close() -> None:
+        window.destroy()
+        root.destroy()
+
+    window.protocol("WM_DELETE_WINDOW", on_close)
 
 
 def load_tif_stack(path: str) -> np.ndarray:
@@ -877,6 +1062,10 @@ class StackAnalyzerApp:
         self.btn_browse = widgets.Button(ax_browse, "Browse…")
         self.btn_browse.on_clicked(self._browse_file)
 
+        ax_inspect_pickle = self.fig.add_axes([0.14, 0.905, 0.11, 0.035])
+        self.btn_inspect_pickle = widgets.Button(ax_inspect_pickle, "Inspect Pickle")
+        self.btn_inspect_pickle.on_clicked(self._on_inspect_pickle)
+
         ax_draw = self.fig.add_axes([0.05, 0.855, 0.08, 0.035])
         self.btn_draw = widgets.Button(ax_draw, "Draw ROI")
         self.btn_draw.on_clicked(self._toggle_draw_mode)
@@ -965,6 +1154,27 @@ class StackAnalyzerApp:
         root.destroy()
         if path:
             self.load_stack(path)
+
+    def _on_inspect_pickle(self, _event) -> None:
+        path = self.quant_pickle_path
+        if path is None:
+            root = tk.Tk()
+            root.withdraw()
+            path_str = filedialog.askopenfilename(
+                title="Select ROI quantification pickle",
+                filetypes=[("Pickle files", "*.pkl"), ("All files", "*.*")],
+            )
+            root.destroy()
+            if not path_str:
+                return
+            path = Path(path_str)
+        elif not path.exists():
+            messagebox.showinfo(
+                "Inspect Pickle",
+                f"No pickle file found at:\n{path}\n\nLoad a TIFF stack to create one.",
+            )
+            return
+        open_quant_pickle_inspector(path)
 
     def _toggle_draw_mode(self, _event) -> None:
         if self.roi_tool is None:
@@ -1141,6 +1351,25 @@ class StackAnalyzerApp:
         root.wait_window(dialog)
         return choice["value"]
 
+    def _pickle_settings_for_stack(self, store: dict) -> dict | None:
+        if self.stack is None or not self.file_path or not store.get("rows"):
+            return None
+
+        current_dir = os.path.dirname(os.path.abspath(self.file_path))
+        current_size = format_stack_size(
+            self.stack.shape[2], self.stack.shape[1], self.n_frames
+        )
+        for row in store["rows"]:
+            if row.get("directory") != current_dir:
+                continue
+            if row.get("size") != current_size:
+                continue
+            try:
+                return quant_settings_from_row(row)
+            except (ValueError, KeyError, TypeError):
+                continue
+        return None
+
     def _apply_quant_settings_to_gui(self, settings: dict) -> None:
         self._applying_quant_settings = True
         self.acq_fps = settings["acq_fps"]
@@ -1152,7 +1381,9 @@ class StackAnalyzerApp:
             else str(settings["avr_factor"])
         )
         self._update_effective_fps_display()
-        self.slider_window.set_val(settings["sg_window"])
+        sg_window = min(int(settings["sg_window"]), int(self.slider_window.valmax))
+        sg_window = max(3, sg_window if sg_window % 2 else sg_window - 1)
+        self.slider_window.set_val(sg_window)
         self.slider_poly.set_val(settings["sg_poly"])
         self.slider_extension.set_val(settings["extension"])
         self.start_frames = parse_start_frames(settings["starts"], self.n_frames)
@@ -1575,14 +1806,19 @@ class StackAnalyzerApp:
         if self.slider_window.val > self.slider_window.valmax:
             self.slider_window.set_val(min(51, self.slider_window.valmax))
 
-        self.start_frames = parse_start_frames(DEFAULT_STARTS, self.n_frames)
-        self._sync_starts_textbox_from_frames(self.start_frames)
-        self._update_area_slider_limits()
+        store = load_quant_store(self.quant_pickle_path)
+        pickle_settings = self._pickle_settings_for_stack(store)
+        if pickle_settings is not None:
+            self._apply_quant_settings_to_gui(pickle_settings)
+        else:
+            self.start_frames = parse_start_frames(DEFAULT_STARTS, self.n_frames)
+            self._sync_starts_textbox_from_frames(self.start_frames)
+            self._update_area_slider_limits()
+            self._update_analysis()
 
         name = path if len(path) <= 120 else "…" + path[-117:]
         self.file_text.set_text(f"{name}  |  {self.n_frames} frames, {height}×{width}")
 
-        self._update_analysis()
         if self.show_saved_rois:
             self._update_saved_roi_display()
 
