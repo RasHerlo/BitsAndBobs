@@ -338,13 +338,36 @@ class EditableROI:
     def clear(self) -> None:
         self.vertices = None
         self.mask = None
+        self.draw_mode = False
+        self._drag_mode = None
+        self._edit_vertex_idx = None
+        self._clear_preview()
+        self._purge_display()
+        self._update_handles()
+        self.on_change()
+        self.ax.figure.canvas.draw_idle()
+
+    def _purge_display(self) -> None:
+        """Remove ROI polygon/handles from the axes, including stale duplicates."""
         self._remove_artist(self.patch)
         self.patch = None
         self._remove_artist(self.handle_artists)
         self.handle_artists = None
         self._remove_artist(self.preview_line)
         self.preview_line = None
-        self.on_change()
+
+        target_edge = np.array(mcolors.to_rgba(self.edge_color))
+        for artist in list(self.ax.patches):
+            if not isinstance(artist, Polygon):
+                continue
+            if artist.get_zorder() != self.zorder:
+                continue
+            try:
+                edge = np.asarray(artist.get_edgecolor())
+                if edge.shape == target_edge.shape and np.allclose(edge, target_edge, atol=0.1):
+                    artist.remove()
+            except (ValueError, AttributeError, TypeError):
+                continue
 
     def _remove_artist(self, artist) -> None:
         if artist is not None:
@@ -414,8 +437,7 @@ class EditableROI:
 
     def _update_patch(self) -> None:
         if self.vertices is None or len(self.vertices) < 3:
-            self._remove_artist(self.patch)
-            self.patch = None
+            self._purge_display()
             self._update_handles()
             return
 
@@ -821,7 +843,9 @@ class StackAnalyzerApp:
     def _clear_bg_roi(self) -> None:
         if self.bg_roi_tool is not None:
             self.bg_roi_tool.clear()
-            self.fig.canvas.draw_idle()
+        self.raw_bg_trace = None
+        self._update_roi_traces()
+        self.fig.canvas.draw_idle()
 
     def _on_starts_changed(self, text: str) -> None:
         self.starts_text = text
@@ -1319,7 +1343,16 @@ class StackAnalyzerApp:
     def _on_bg_changed(self) -> None:
         if self.stack is None or self.bg_roi_tool is None:
             return
-        self.raw_bg_trace = compute_raw_trace(self.stack, self.bg_roi_tool.mask)
+        mask = self.bg_roi_tool.mask
+        if mask is None or not np.any(mask):
+            self.raw_bg_trace = None
+            if self.bg_roi_tool.vertices is not None:
+                self.bg_roi_tool.vertices = None
+                self.bg_roi_tool.mask = None
+                self.bg_roi_tool._purge_display()
+                self.bg_roi_tool._update_handles()
+        else:
+            self.raw_bg_trace = compute_raw_trace(self.stack, mask)
         self._update_roi_traces()
 
     def _corrected_smooth_trace(self) -> np.ndarray | None:
