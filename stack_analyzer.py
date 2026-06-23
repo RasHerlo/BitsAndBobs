@@ -14,6 +14,8 @@ from tkinter import filedialog, messagebox, ttk
 import matplotlib.pyplot as plt
 import matplotlib.widgets as widgets
 from matplotlib import colors as mcolors
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.figure import Figure
 import numpy as np
 import tifffile
 from matplotlib.path import Path as MplPath
@@ -48,6 +50,7 @@ QUANT_COLUMNS = [
     "max vals",
     "bleach correct",
     "BC baseline",
+    "Man. Adj.",
 ]
 
 
@@ -329,6 +332,61 @@ def backfill_bleach_correction(store: dict) -> bool:
     return changed
 
 
+def parse_man_adj(value) -> float:
+    if value is None:
+        return 0.0
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def ensure_man_adj_defaults(store: dict) -> bool:
+    changed = False
+    for row in store.get("rows", []):
+        if row.get("Man. Adj.") is None:
+            row["Man. Adj."] = 0.0
+            changed = True
+    return changed
+
+
+def compute_row_mark_event_traces(
+    row: dict,
+    man_adj: float = 0.0,
+) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None]:
+    """Return smoothed BG-corrected trace, shifted BC baseline, and normalized trace."""
+    bg_trace = row.get("BG trc")
+    roi_trace = row.get("ROI trc")
+    if bg_trace is None or roi_trace is None:
+        return None, None, None
+
+    if row_needs_bleach_update(row):
+        update_row_bleach_correction(row)
+
+    bc_baseline = row.get("BC baseline")
+    if bc_baseline is None:
+        return None, None, None
+
+    try:
+        sg_window, sg_poly = parse_sg_field(row["SG window and order"])
+    except (ValueError, KeyError, TypeError):
+        return None, None, None
+
+    smooth = compute_bg_corrected_smooth_trace(roi_trace, bg_trace, sg_window, sg_poly)
+    length = min(len(smooth), len(bc_baseline))
+    if length == 0:
+        return None, None, None
+
+    smooth = smooth[:length]
+    adjusted_baseline = np.asarray(bc_baseline[:length], dtype=np.float64) + man_adj
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        normalized = smooth / adjusted_baseline
+    normalized = np.where(np.isfinite(normalized), normalized, np.nan)
+
+    return smooth, adjusted_baseline, normalized
+
+
 def summarize_quant_cell(column: str, value) -> str:
     """Short one-line value for the pickle inspector table."""
     if value is None:
@@ -459,6 +517,7 @@ def open_quant_pickle_inspector(path: Path) -> None:
         "max vals": 120,
         "bleach correct": 130,
         "BC baseline": 130,
+        "Man. Adj.": 70,
     }
     for column in tree_columns:
         heading = "#" if column == "#" else column
@@ -759,6 +818,280 @@ def clip_vertices(vertices: np.ndarray, width: int, height: int) -> np.ndarray:
     clipped[:, 0] = np.clip(clipped[:, 0], 0, width - 1)
     clipped[:, 1] = np.clip(clipped[:, 1], 0, height - 1)
     return clipped
+
+
+class MarkEventsWindow:
+    """Secondary window for inspecting saved ROIs and adjusting BC baseline shift."""
+
+    def __init__(self, app: "StackAnalyzerApp") -> None:
+        if app.stack is None or app.z_average is None or app.quant_pickle_path is None:
+            messagebox.showinfo("Mark Events", "Load a TIFF stack first.")
+            return
+
+        self.app = app
+        self.store = load_quant_store(app.quant_pickle_path)
+        store_changed = ensure_man_adj_defaults(self.store)
+        if backfill_bleach_correction(self.store):
+            store_changed = True
+        if store_changed:
+            save_quant_store(app.quant_pickle_path, self.store)
+
+        current_dir = os.path.dirname(os.path.abspath(app.file_path))
+        current_size = format_stack_size(
+            app.stack.shape[2], app.stack.shape[1], app.stack.shape[0]
+        )
+        self.entries: list[tuple[int, dict]] = []
+        for row_index, row in enumerate(self.store.get("rows", [])):
+            if row.get("directory") != current_dir:
+                continue
+            if row.get("size") != current_size:
+                continue
+            self.entries.append((row_index, row))
+
+        if not self.entries:
+            messagebox.showinfo(
+                "Mark Events",
+                "No saved ROI rows for this stack in the pickle file.",
+            )
+            return
+
+        app._mark_events_window = self
+        self.entry_pos = 0
+        if app._active_saved_roi_row_index is not None:
+            for pos, (row_index, _row) in enumerate(self.entries):
+                if row_index == app._active_saved_roi_row_index:
+                    self.entry_pos = pos
+                    break
+
+        self._man_adj_step = 1.0
+        self._updating_man_adj_field = False
+
+        self.root = tk.Toplevel()
+        self.root.title("Mark Events")
+        self.root.geometry("1220x760")
+        self.root.minsize(920, 580)
+
+        top = tk.Frame(self.root, padx=8, pady=6)
+        top.pack(fill="x")
+
+        tk.Button(top, text="◀", width=3, command=self._prev_row).pack(side="left")
+        self.row_label = tk.Label(top, text="", font=("", 11, "bold"))
+        self.row_label.pack(side="left", padx=10)
+        tk.Button(top, text="▶", width=3, command=self._next_row).pack(side="left")
+
+        adj_frame = tk.Frame(top, padx=20)
+        adj_frame.pack(side="right")
+        tk.Label(adj_frame, text="Man. Adj.").pack(side="left", padx=(0, 6))
+        tk.Button(adj_frame, text="▼", width=2, command=lambda: self._bump_man_adj(-1)).pack(
+            side="left"
+        )
+        self.man_adj_var = tk.DoubleVar(value=0.0)
+        self.man_adj_entry = tk.Entry(
+            adj_frame, textvariable=self.man_adj_var, width=10, justify="center"
+        )
+        self.man_adj_entry.pack(side="left", padx=4)
+        self.man_adj_entry.bind("<Return>", self._on_man_adj_commit)
+        self.man_adj_entry.bind("<FocusOut>", self._on_man_adj_commit)
+        self.man_adj_var.trace_add("write", self._on_man_adj_live)
+        tk.Button(adj_frame, text="▲", width=2, command=lambda: self._bump_man_adj(1)).pack(
+            side="left"
+        )
+
+        plot_frame = tk.Frame(self.root)
+        plot_frame.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+        self.fig = Figure(figsize=(12.0, 7.0), dpi=100)
+        grid = self.fig.add_gridspec(1, 2, width_ratios=[1.05, 1.0], wspace=0.28)
+        self.ax_image = self.fig.add_subplot(grid[0, 0])
+        right = grid[0, 1].subgridspec(2, 1, hspace=0.34)
+        self.ax_upper = self.fig.add_subplot(right[0, 0])
+        self.ax_lower = self.fig.add_subplot(right[1, 0], sharex=self.ax_upper)
+
+        self.canvas = FigureCanvasTkAgg(self.fig, master=plot_frame)
+        self.canvas.get_tk_widget().pack(fill="both", expand=True)
+
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        self._refresh_all()
+
+    def _on_close(self) -> None:
+        self.app._mark_events_window = None
+        self.root.destroy()
+
+    def _current_row_index(self) -> int:
+        return self.entries[self.entry_pos][0]
+
+    def _current_row(self) -> dict:
+        return self.entries[self.entry_pos][1]
+
+    def _prev_row(self) -> None:
+        if self.entry_pos > 0:
+            self.entry_pos -= 1
+            self._refresh_all()
+
+    def _next_row(self) -> None:
+        if self.entry_pos < len(self.entries) - 1:
+            self.entry_pos += 1
+            self._refresh_all()
+
+    def _bump_man_adj(self, direction: int) -> None:
+        current = self._current_man_adj_value()
+        self.man_adj_var.set(current + direction * self._man_adj_step)
+        self._save_man_adj_to_pickle()
+
+    def _on_man_adj_live(self, *_args) -> None:
+        if self._updating_man_adj_field:
+            return
+        try:
+            float(self.man_adj_var.get())
+        except (tk.TclError, ValueError):
+            return
+        self._draw_traces()
+        self.canvas.draw_idle()
+
+    def _on_man_adj_commit(self, _event=None) -> None:
+        self._save_man_adj_to_pickle()
+
+    def _current_man_adj_value(self) -> float:
+        try:
+            return float(self.man_adj_var.get())
+        except (tk.TclError, ValueError):
+            return parse_man_adj(self._current_row().get("Man. Adj."))
+
+    def _save_man_adj_to_pickle(self) -> None:
+        if self._updating_man_adj_field:
+            return
+        try:
+            value = float(self.man_adj_var.get())
+        except (tk.TclError, ValueError):
+            value = parse_man_adj(self._current_row().get("Man. Adj."))
+            self._updating_man_adj_field = True
+            self.man_adj_var.set(value)
+            self._updating_man_adj_field = False
+            return
+
+        row_index = self._current_row_index()
+        self.store["rows"][row_index]["Man. Adj."] = value
+        save_quant_store(self.app.quant_pickle_path, self.store)
+
+    def _refresh_all(self) -> None:
+        row = self._current_row()
+        man_adj = parse_man_adj(row.get("Man. Adj."))
+        self._updating_man_adj_field = True
+        self.man_adj_var.set(man_adj)
+        self._updating_man_adj_field = False
+
+        smooth, _baseline, _normalized = compute_row_mark_event_traces(row, man_adj)
+        if smooth is not None and smooth.size:
+            self._man_adj_step = max(1e-6, float(np.nanstd(smooth)) * 0.01)
+        else:
+            self._man_adj_step = 1.0
+
+        row_index = self._current_row_index()
+        self.row_label.config(
+            text=f"Row {row_index + 1}  ({self.entry_pos + 1} / {len(self.entries)})"
+        )
+        self._draw_image()
+        self._draw_traces()
+        self.canvas.draw_idle()
+
+    def _draw_image(self) -> None:
+        app = self.app
+        z_average = app.z_average
+        assert z_average is not None
+        height, width = z_average.shape
+        area_map = app._ensure_area_map_for_mark_events()
+
+        self.ax_image.clear()
+        self.ax_image.imshow(
+            z_average,
+            cmap="gray",
+            extent=[0, width, height, 0],
+            aspect="equal",
+        )
+        if area_map is not None:
+            self.ax_image.imshow(
+                area_map,
+                cmap="inferno",
+                alpha=0.5,
+                extent=[0, width, height, 0],
+                aspect="equal",
+            )
+
+        active_row_index = self._current_row_index()
+        for row_index, row in self.entries:
+            vertices = row.get("ROI pixels")
+            if vertices is None:
+                continue
+            verts = np.asarray(vertices, dtype=float)
+            if verts.ndim != 2 or len(verts) < 3:
+                continue
+            is_active = row_index == active_row_index
+            patch = Polygon(
+                verts,
+                closed=True,
+                fill=False,
+                edgecolor="lime" if is_active else "black",
+                linewidth=2.2 if is_active else 0.9,
+                zorder=4 if is_active else 3,
+            )
+            self.ax_image.add_patch(patch)
+
+        self.ax_image.set_title("Z-average + area heatmap")
+        self.ax_image.set_xlabel("x (px)")
+        self.ax_image.set_ylabel("y (px)")
+
+    def _draw_traces(self, man_adj: float | None = None) -> None:
+        app = self.app
+        row_index = self._current_row_index()
+        row = self._current_row()
+        if man_adj is None:
+            man_adj = self._current_man_adj_value()
+        smooth, baseline, normalized = compute_row_mark_event_traces(row, man_adj)
+
+        self.ax_upper.clear()
+        self.ax_lower.clear()
+
+        xlabel = app._trace_xlabel()
+        if smooth is None or baseline is None or normalized is None:
+            message = "BC-corrected traces require ROI, BG, and bleach correction data."
+            self.ax_upper.text(
+                0.5,
+                0.5,
+                message,
+                transform=self.ax_upper.transAxes,
+                ha="center",
+                va="center",
+            )
+            self.ax_upper.set_title(f"Row {row_index + 1}: smoothed BC-corrected")
+            self.ax_lower.set_title(f"Row {row_index + 1}: normalized to BC baseline")
+            self.ax_upper.set_xlabel(xlabel)
+            self.ax_lower.set_xlabel(xlabel)
+            self.canvas.draw_idle()
+            return
+
+        n_frames = len(smooth)
+        x = app._frames_to_axis(np.arange(n_frames, dtype=float), one_based=False)
+
+        self.ax_upper.plot(x, smooth, color="0.15", linewidth=1.0, label="smoothed")
+        self.ax_upper.plot(
+            x,
+            baseline,
+            color="red",
+            linestyle=":",
+            linewidth=1.2,
+            label="BC baseline",
+        )
+        self.ax_upper.legend(loc="upper right", fontsize=8)
+        self.ax_upper.set_ylabel("Intensity")
+        self.ax_upper.set_title(f"Row {row_index + 1}: smoothed BC-corrected")
+        self.ax_upper.set_xlabel(xlabel)
+
+        self.ax_lower.plot(x, normalized, color="0.15", linewidth=1.0)
+        self.ax_lower.axhline(1.0, color="red", linestyle=":", linewidth=1.2, label="baseline (=1)")
+        self.ax_lower.legend(loc="upper right", fontsize=8)
+        self.ax_lower.set_ylabel("Normalized")
+        self.ax_lower.set_title(f"Row {row_index + 1}: normalized to BC baseline")
+        self.ax_lower.set_xlabel(xlabel)
+        self.canvas.draw_idle()
 
 
 class EditableROI:
@@ -1157,6 +1490,7 @@ class StackAnalyzerApp:
         self._active_saved_roi_row_index: int | None = None
         self._loading_saved_roi = False
         self._applying_quant_settings = False
+        self._mark_events_window: MarkEventsWindow | None = None
 
         self.fig = plt.figure(figsize=(16, 9))
         self.fig.canvas.manager.set_window_title("Stack Analyzer")
@@ -1232,6 +1566,10 @@ class StackAnalyzerApp:
         ax_delete_roi = self.fig.add_axes([0.14, 0.775, 0.08, 0.035])
         self.btn_delete_roi = widgets.Button(ax_delete_roi, "Delete ROI")
         self.btn_delete_roi.on_clicked(self._on_delete_roi)
+
+        ax_mark_events = self.fig.add_axes([0.23, 0.775, 0.10, 0.035])
+        self.btn_mark_events = widgets.Button(ax_mark_events, "Mark Events")
+        self.btn_mark_events.on_clicked(self._on_mark_events)
 
         ax_window = self.fig.add_axes([0.30, 0.905, 0.18, 0.025])
         self.slider_window = widgets.Slider(ax_window, "SG window", 3, 501, valinit=51, valstep=2)
@@ -1796,6 +2134,28 @@ class StackAnalyzerApp:
             f"Deleted ROI row {row_index + 1} from {self.quant_pickle_path.name} "
             f"({len(store['rows'])} rows remaining)."
         )
+
+    def _on_mark_events(self, _event) -> None:
+        if self._mark_events_window is not None:
+            try:
+                if self._mark_events_window.root.winfo_exists():
+                    self._mark_events_window.root.lift()
+                    self._mark_events_window.root.focus_force()
+                    return
+            except (tk.TclError, AttributeError):
+                pass
+            self._mark_events_window = None
+        MarkEventsWindow(self)
+
+    def _ensure_area_map_for_mark_events(self) -> np.ndarray | None:
+        if self.stack is None or self.z_average is None:
+            return None
+        if self.pixel_mean_trace is None or self._heatmap_traces_dirty:
+            if not self._ensure_pixel_mean_traces():
+                return None
+        if self.area_map_cache is None and not self._compute_area_map_cache():
+            return None
+        return self.area_map_cache
 
     def _set_status_message(self, message: str) -> None:
         self.file_text.set_text(message)
