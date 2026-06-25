@@ -484,6 +484,18 @@ def format_marked_events_for_storage(pairs: list[tuple[int, int]]) -> list[list[
     return [[int(start), int(finish)] for start, finish in _normalize_event_pairs(pairs)]
 
 
+def bg_pixels_equal(left, right) -> bool:
+    if left is None and right is None:
+        return True
+    if left is None or right is None:
+        return False
+    left_arr = np.asarray(left, dtype=np.float64)
+    right_arr = np.asarray(right, dtype=np.float64)
+    if left_arr.shape != right_arr.shape:
+        return False
+    return bool(np.allclose(left_arr, right_arr, atol=1e-6, rtol=0.0))
+
+
 def draw_locked_marked_events(
     ax,
     row: dict,
@@ -1898,6 +1910,7 @@ class StackAnalyzerApp:
         self._active_saved_roi_row_index: int | None = None
         self._loading_saved_roi = False
         self._applying_quant_settings = False
+        self._suppress_bg_change_prompt = False
         self._mark_events_window: MarkEventsWindow | None = None
 
         self.fig = plt.figure(figsize=(16, 9))
@@ -2114,11 +2127,14 @@ class StackAnalyzerApp:
                 pass
         self._saved_roi_overlays = []
 
-    def _saved_roi_entries_for_current_stack(self) -> list[tuple[int, dict]]:
-        if self.stack is None or self.quant_pickle_path is None or not self.file_path:
+    def _stack_row_entries(self, store: dict | None = None) -> list[tuple[int, dict]]:
+        if self.stack is None or not self.file_path:
             return []
+        if store is None:
+            if self.quant_pickle_path is None:
+                return []
+            store = load_quant_store(self.quant_pickle_path)
 
-        store = load_quant_store(self.quant_pickle_path)
         current_dir = os.path.dirname(os.path.abspath(self.file_path))
         current_size = format_stack_size(
             self.stack.shape[2], self.stack.shape[1], self.stack.shape[0]
@@ -2131,6 +2147,139 @@ class StackAnalyzerApp:
                 continue
             entries.append((row_index, row))
         return entries
+
+    def _first_stack_row(self, store: dict) -> dict | None:
+        entries = self._stack_row_entries(store)
+        return entries[0][1] if entries else None
+
+    def _stack_rows_have_mismatched_bg(self, store: dict) -> bool:
+        entries = self._stack_row_entries(store)
+        if len(entries) <= 1:
+            return False
+
+        reference_pixels = None
+        reference_defined = False
+        for _row_index, row in entries:
+            pixels = row.get("BG pixels")
+            if pixels is None:
+                if reference_defined:
+                    return True
+                continue
+            if not reference_defined:
+                reference_pixels = pixels
+                reference_defined = True
+            elif not bg_pixels_equal(reference_pixels, pixels):
+                return True
+        return False
+
+    def _compute_bg_trace_from_pixels(self, bg_pixels) -> np.ndarray | None:
+        if self.stack is None or self.bg_roi_tool is None or bg_pixels is None:
+            return None
+        verts = clip_vertices(
+            np.asarray(bg_pixels, dtype=np.float64),
+            self.bg_roi_tool.width,
+            self.bg_roi_tool.height,
+        )
+        mask = polygon_mask(verts, self.bg_roi_tool.height, self.bg_roi_tool.width)
+        return compute_raw_trace(self.stack, mask)
+
+    def _copy_bg_from_first_stack_row(self, store: dict) -> bool:
+        first_row = self._first_stack_row(store)
+        if first_row is None:
+            return False
+
+        bg_pixels = first_row.get("BG pixels")
+        bg_trace = self._compute_bg_trace_from_pixels(bg_pixels)
+        if bg_pixels is not None and bg_trace is None:
+            bg_trace = first_row.get("BG trc")
+
+        for _row_index, row in self._stack_row_entries(store):
+            if bg_pixels is None:
+                row["BG pixels"] = None
+                row["BG trc"] = None
+                row["bleach correct"] = None
+                row["BC baseline"] = None
+                row[BC_CORR_NORM_TRC_COLUMN] = None
+            else:
+                row["BG pixels"] = np.asarray(bg_pixels, dtype=np.float64).copy()
+                row["BG trc"] = np.asarray(bg_trace, dtype=np.float64).copy()
+                update_row_bleach_correction(row)
+                update_row_bc_corr_norm_trc(row)
+        return True
+
+    def _ensure_unified_bg_on_load(self, store: dict) -> bool:
+        if not self._stack_rows_have_mismatched_bg(store):
+            return False
+        if not messagebox.askyesno(
+            "BG ROI mismatch",
+            "This pickle file has different BG ROIs across rows for the loaded stack.\n\n"
+            "Copy the BG ROI from row 1 to all other rows for this stack?",
+        ):
+            return False
+        return self._copy_bg_from_first_stack_row(store)
+
+    def _ask_apply_new_bg_roi(self) -> bool:
+        return messagebox.askyesno(
+            "BG ROI changed",
+            "A new BG ROI was drawn.\n\n"
+            "Yes: replace the BG ROI in all rows for this stack.\n"
+            "No: discard this change and restore the previous BG ROI.",
+        )
+
+    def _apply_bg_to_all_stack_rows(
+        self,
+        bg_pixels: np.ndarray | None,
+        bg_trace: np.ndarray | None,
+    ) -> None:
+        if self.quant_pickle_path is None:
+            return
+
+        store = load_quant_store(self.quant_pickle_path)
+        pixels_copy = None if bg_pixels is None else np.asarray(bg_pixels, dtype=np.float64).copy()
+        trace_copy = None if bg_trace is None else np.asarray(bg_trace, dtype=np.float64).copy()
+
+        for _row_index, row in self._stack_row_entries(store):
+            row["BG pixels"] = None if pixels_copy is None else pixels_copy.copy()
+            row["BG trc"] = None if trace_copy is None else trace_copy.copy()
+            if trace_copy is None:
+                row["bleach correct"] = None
+                row["BC baseline"] = None
+                row[BC_CORR_NORM_TRC_COLUMN] = None
+            else:
+                update_row_bleach_correction(row)
+                update_row_bc_corr_norm_trc(row)
+
+        save_quant_store(self.quant_pickle_path, store)
+
+    def _restore_canonical_bg_roi(self) -> None:
+        if self.quant_pickle_path is None:
+            self.raw_bg_trace = None
+            if self.bg_roi_tool is not None:
+                self._suppress_bg_change_prompt = True
+                try:
+                    self.bg_roi_tool.clear()
+                finally:
+                    self._suppress_bg_change_prompt = False
+            return
+
+        store = load_quant_store(self.quant_pickle_path)
+        first_row = self._first_stack_row(store)
+        self._suppress_bg_change_prompt = True
+        try:
+            if first_row is None:
+                self.raw_bg_trace = None
+                if self.bg_roi_tool is not None:
+                    self.bg_roi_tool.clear()
+            else:
+                self._load_bg_from_row(first_row, suppress_prompt=False)
+        finally:
+            self._suppress_bg_change_prompt = False
+
+    def _saved_roi_entries_for_current_stack(self) -> list[tuple[int, dict]]:
+        if self.quant_pickle_path is None:
+            return []
+        store = load_quant_store(self.quant_pickle_path)
+        return self._stack_row_entries(store)
 
     def _hit_test_saved_roi(self, x: float, y: float) -> int | None:
         for _patch, row_index in reversed(self._saved_roi_overlays):
@@ -2325,26 +2474,33 @@ class StackAnalyzerApp:
         self.roi_tool._notify_mode_change()
         self.roi_tool._update_patch()
 
-    def _load_bg_from_row(self, row: dict) -> None:
+    def _load_bg_from_row(self, row: dict, *, suppress_prompt: bool = True) -> None:
         if self.bg_roi_tool is None:
             return
-        bg_vertices = row.get("BG pixels")
-        if bg_vertices is None:
-            self.bg_roi_tool.clear()
-            self.raw_bg_trace = None
-            return
-        verts = clip_vertices(
-            np.asarray(bg_vertices, dtype=float),
-            self.bg_roi_tool.width,
-            self.bg_roi_tool.height,
-        )
-        self.bg_roi_tool.vertices = verts
-        self.bg_roi_tool.mask = polygon_mask(verts, self.bg_roi_tool.height, self.bg_roi_tool.width)
-        self.bg_roi_tool.draw_mode = False
-        self.bg_roi_tool._notify_mode_change()
-        self.bg_roi_tool._update_patch()
-        if self.stack is not None:
-            self.raw_bg_trace = compute_raw_trace(self.stack, self.bg_roi_tool.mask)
+        previous = self._suppress_bg_change_prompt
+        if suppress_prompt:
+            self._suppress_bg_change_prompt = True
+        try:
+            bg_vertices = row.get("BG pixels")
+            if bg_vertices is None:
+                self.bg_roi_tool.clear()
+                self.raw_bg_trace = None
+                return
+            verts = clip_vertices(
+                np.asarray(bg_vertices, dtype=float),
+                self.bg_roi_tool.width,
+                self.bg_roi_tool.height,
+            )
+            self.bg_roi_tool.vertices = verts
+            self.bg_roi_tool.mask = polygon_mask(verts, self.bg_roi_tool.height, self.bg_roi_tool.width)
+            self.bg_roi_tool.draw_mode = False
+            self.bg_roi_tool._notify_mode_change()
+            self.bg_roi_tool._update_patch()
+            if self.stack is not None:
+                self.raw_bg_trace = compute_raw_trace(self.stack, self.bg_roi_tool.mask)
+        finally:
+            if suppress_prompt:
+                self._suppress_bg_change_prompt = previous
 
     def _activate_saved_roi(self, row_index: int) -> None:
         if self.quant_pickle_path is None or self.stack is None or self.roi_tool is None:
@@ -2788,8 +2944,13 @@ class StackAnalyzerApp:
 
         store = load_quant_store(self.quant_pickle_path)
         store_changed = backfill_bleach_correction(store) or backfill_bc_corr_norm_trc(store)
+        if self._ensure_unified_bg_on_load(store):
+            store_changed = True
         if store_changed:
             save_quant_store(self.quant_pickle_path, store)
+        first_row = self._first_stack_row(store)
+        if first_row is not None and first_row.get("BG pixels") is not None:
+            self._load_bg_from_row(first_row)
         pickle_settings = self._pickle_settings_for_stack(store)
         if pickle_settings is not None:
             self._apply_quant_settings_to_gui(pickle_settings)
@@ -3151,16 +3312,51 @@ class StackAnalyzerApp:
     def _on_bg_changed(self) -> None:
         if self.stack is None or self.bg_roi_tool is None:
             return
+
+        if self._suppress_bg_change_prompt:
+            mask = self.bg_roi_tool.mask
+            if mask is None or not np.any(mask):
+                self.raw_bg_trace = None
+            else:
+                self.raw_bg_trace = compute_raw_trace(self.stack, mask)
+            self._update_roi_traces()
+            return
+
+        store = load_quant_store(self.quant_pickle_path) if self.quant_pickle_path else None
+        first_row = self._first_stack_row(store) if store is not None else None
+        canonical_pixels = None if first_row is None else first_row.get("BG pixels")
+
         mask = self.bg_roi_tool.mask
-        if mask is None or not np.any(mask):
-            self.raw_bg_trace = None
-            if self.bg_roi_tool.vertices is not None:
-                self.bg_roi_tool.vertices = None
-                self.bg_roi_tool.mask = None
-                self.bg_roi_tool._purge_display()
-                self.bg_roi_tool._update_handles()
-        else:
+        new_vertices = (
+            None
+            if self.bg_roi_tool.vertices is None
+            else np.asarray(self.bg_roi_tool.vertices, dtype=np.float64)
+        )
+        has_bg = (
+            new_vertices is not None
+            and mask is not None
+            and np.any(mask)
+            and len(new_vertices) >= 3
+        )
+
+        if not has_bg:
+            if bg_pixels_equal(canonical_pixels, None):
+                self.raw_bg_trace = None
+            elif self._ask_apply_new_bg_roi():
+                self.raw_bg_trace = None
+                self._apply_bg_to_all_stack_rows(None, None)
+            else:
+                self._restore_canonical_bg_roi()
+                return
+        elif bg_pixels_equal(canonical_pixels, new_vertices):
             self.raw_bg_trace = compute_raw_trace(self.stack, mask)
+        elif self._ask_apply_new_bg_roi():
+            self.raw_bg_trace = compute_raw_trace(self.stack, mask)
+            self._apply_bg_to_all_stack_rows(new_vertices, self.raw_bg_trace)
+        else:
+            self._restore_canonical_bg_roi()
+            return
+
         if self._active_saved_roi_row_index is not None and not self._loading_saved_roi:
             self._apply_quant_settings_to_all_rows(self._current_quant_settings())
             self._sync_active_quant_row()
