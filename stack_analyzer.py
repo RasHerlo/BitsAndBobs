@@ -24,6 +24,8 @@ from scipy.integrate import trapezoid
 from scipy.optimize import curve_fit
 from scipy.signal import savgol_filter
 
+from portable_paths import directory_matches, resolve_directory
+
 SEGMENT_COLORS = plt.cm.tab10.colors
 HANDLE_RADIUS = 14
 MIN_FREEHAND_POINTS = 4
@@ -511,10 +513,17 @@ def draw_locked_marked_events(
         ax.axvspan(span_left, span_right, color="0.55", alpha=0.22, lw=0, zorder=2)
 
 
-def summarize_quant_cell(column: str, value) -> str:
+def summarize_quant_cell(
+    column: str,
+    value,
+    *,
+    current_directory: str | Path | None = None,
+) -> str:
     """Short one-line value for the pickle inspector table."""
     if value is None:
         return ""
+    if column == "directory" and current_directory is not None:
+        value = resolve_directory(str(value), current_directory)
     if column == MARKED_EVENTS_COLUMN:
         pairs = parse_marked_events(value)
         if not pairs:
@@ -544,10 +553,17 @@ def summarize_quant_cell(column: str, value) -> str:
     return text
 
 
-def format_quant_value_detail(column: str, value) -> str:
+def format_quant_value_detail(
+    column: str,
+    value,
+    *,
+    current_directory: str | Path | None = None,
+) -> str:
     """Multi-line detail for one pickle row field."""
     if value is None:
         return "None"
+    if column == "directory" and current_directory is not None:
+        value = resolve_directory(str(value), current_directory)
     if isinstance(value, np.ndarray):
         if value.size == 0:
             return "[]"
@@ -569,21 +585,42 @@ def format_quant_value_detail(column: str, value) -> str:
     return str(value)
 
 
-def format_quant_row_detail(row: dict, row_index: int, columns: list[str]) -> str:
+def format_quant_row_detail(
+    row: dict,
+    row_index: int,
+    columns: list[str],
+    *,
+    current_directory: str | Path | None = None,
+) -> str:
     lines = [f"Row {row_index}"]
     for column in columns:
         if column not in row:
             continue
         lines.append(f"\n{column}:")
-        lines.append(format_quant_value_detail(column, row[column]))
+        lines.append(
+            format_quant_value_detail(
+                column,
+                row[column],
+                current_directory=current_directory,
+            )
+        )
     return "\n".join(lines)
 
 
-def open_quant_pickle_inspector(path: Path) -> None:
+def open_quant_pickle_inspector(
+    path: Path,
+    *,
+    current_directory: str | Path | None = None,
+) -> None:
     """Open a scrollable overview of the ROI quantification pickle file."""
     store = load_quant_store(path)
     columns = list(store.get("columns", QUANT_COLUMNS))
     rows = store.get("rows", [])
+    resolved_directory = (
+        Path(current_directory).resolve()
+        if current_directory is not None
+        else path.parent.resolve()
+    )
     tree_columns = ["#"] + columns
 
     root = tk.Tk()
@@ -681,7 +718,13 @@ def open_quant_pickle_inspector(path: Path) -> None:
     for row_index, row in enumerate(rows):
         values = [str(row_index)]
         for column in columns:
-            values.append(summarize_quant_cell(column, row.get(column)))
+            values.append(
+                summarize_quant_cell(
+                    column,
+                    row.get(column),
+                    current_directory=resolved_directory,
+                )
+            )
         tree.insert("", "end", iid=str(row_index), values=values)
 
     def show_row_detail(_event=None) -> None:
@@ -693,7 +736,15 @@ def open_quant_pickle_inspector(path: Path) -> None:
             return
         row_index = int(selection[0])
         if 0 <= row_index < len(rows):
-            detail_text.insert("1.0", format_quant_row_detail(rows[row_index], row_index, columns))
+            detail_text.insert(
+                "1.0",
+                format_quant_row_detail(
+                    rows[row_index],
+                    row_index,
+                    columns,
+                    current_directory=resolved_directory,
+                ),
+            )
         detail_text.config(state="disabled")
 
     tree.bind("<<TreeviewSelect>>", show_row_detail)
@@ -977,7 +1028,7 @@ class MarkEventsWindow:
         )
         self.entries: list[tuple[int, dict]] = []
         for row_index, row in enumerate(self.store.get("rows", [])):
-            if row.get("directory") != current_dir:
+            if not directory_matches(row.get("directory"), current_dir):
                 continue
             if row.get("size") != current_size:
                 continue
@@ -2080,7 +2131,14 @@ class StackAnalyzerApp:
                 f"No pickle file found at:\n{path}\n\nLoad a TIFF stack to create one.",
             )
             return
-        open_quant_pickle_inspector(path)
+        open_quant_pickle_inspector(
+            path,
+            current_directory=(
+                os.path.dirname(os.path.abspath(self.file_path))
+                if self.file_path
+                else None
+            ),
+        )
 
     def _toggle_draw_mode(self, _event) -> None:
         if self.roi_tool is None:
@@ -2141,7 +2199,7 @@ class StackAnalyzerApp:
         )
         entries: list[tuple[int, dict]] = []
         for row_index, row in enumerate(store.get("rows", [])):
-            if row.get("directory") != current_dir:
+            if not directory_matches(row.get("directory"), current_dir):
                 continue
             if row.get("size") != current_size:
                 continue
@@ -2402,7 +2460,7 @@ class StackAnalyzerApp:
             self.stack.shape[2], self.stack.shape[1], self.n_frames
         )
         for row in store["rows"]:
-            if row.get("directory") != current_dir:
+            if not directory_matches(row.get("directory"), current_dir):
                 continue
             if row.get("size") != current_size:
                 continue
