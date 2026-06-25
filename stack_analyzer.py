@@ -52,9 +52,11 @@ QUANT_COLUMNS = [
     "BC baseline",
     "Man. Adj.",
     "Marked events",
+    "BC-corr. Norm-Trc",
 ]
 
 MARKED_EVENTS_COLUMN = "Marked events"
+BC_CORR_NORM_TRC_COLUMN = "BC-corr. Norm-Trc"
 
 
 def quant_pickle_path_for_stack(stack_path: str) -> Path:
@@ -202,7 +204,7 @@ def quant_settings_equal(left: dict, right: dict) -> bool:
 
 
 TRACE_SUMMARY_COLUMNS = frozenset(
-    {"BG trc", "ROI trc", "bleach correct", "BC baseline"}
+    {"BG trc", "ROI trc", "bleach correct", "BC baseline", BC_CORR_NORM_TRC_COLUMN}
 )
 
 
@@ -302,6 +304,7 @@ def update_row_bleach_correction(row: dict) -> bool:
     if bg_trace is None or roi_trace is None:
         row["bleach correct"] = None
         row["BC baseline"] = None
+        row[BC_CORR_NORM_TRC_COLUMN] = None
         return False
 
     try:
@@ -309,6 +312,7 @@ def update_row_bleach_correction(row: dict) -> bool:
     except (ValueError, KeyError, TypeError):
         row["bleach correct"] = None
         row["BC baseline"] = None
+        row[BC_CORR_NORM_TRC_COLUMN] = None
         return False
 
     smooth = compute_bg_corrected_smooth_trace(roi_trace, bg_trace, sg_window, sg_poly)
@@ -316,12 +320,47 @@ def update_row_bleach_correction(row: dict) -> bool:
     if bleach_correct is None:
         row["bleach correct"] = None
         row["BC baseline"] = None
+        row[BC_CORR_NORM_TRC_COLUMN] = None
         return False
 
     bc_baseline = compute_bc_baseline_trace(bleach_correct, smooth)
     row["bleach correct"] = bleach_correct
     row["BC baseline"] = bc_baseline
+    update_row_bc_corr_norm_trc(row)
     return True
+
+
+def update_row_bc_corr_norm_trc(row: dict, man_adj: float | None = None) -> bool:
+    """Compute and store the Mark Events normalized trace for one pickle row."""
+    if man_adj is None:
+        man_adj = parse_man_adj(row.get("Man. Adj."))
+    _smooth, _baseline, normalized = compute_row_mark_event_traces(row, man_adj)
+    if normalized is None:
+        row[BC_CORR_NORM_TRC_COLUMN] = None
+        return False
+    row[BC_CORR_NORM_TRC_COLUMN] = np.asarray(normalized, dtype=np.float64)
+    return True
+
+
+def row_needs_norm_trc_update(row: dict) -> bool:
+    if row.get("BG trc") is None:
+        return False
+    value = row.get(BC_CORR_NORM_TRC_COLUMN)
+    if value is None:
+        return True
+    if isinstance(value, np.ndarray) and value.size == 0:
+        return True
+    return False
+
+
+def backfill_bc_corr_norm_trc(store: dict) -> bool:
+    changed = False
+    for row in store.get("rows", []):
+        if not row_needs_norm_trc_update(row):
+            continue
+        if update_row_bc_corr_norm_trc(row):
+            changed = True
+    return changed
 
 
 def backfill_bleach_correction(store: dict) -> bool:
@@ -599,6 +638,7 @@ def open_quant_pickle_inspector(path: Path) -> None:
         "BC baseline": 130,
         "Man. Adj.": 70,
         "Marked events": 120,
+        "BC-corr. Norm-Trc": 130,
     }
     for column in tree_columns:
         heading = "#" if column == "#" else column
@@ -913,6 +953,8 @@ class MarkEventsWindow:
         self.store = load_quant_store(app.quant_pickle_path)
         store_changed = ensure_man_adj_defaults(self.store)
         if backfill_bleach_correction(self.store):
+            store_changed = True
+        if backfill_bc_corr_norm_trc(self.store):
             store_changed = True
         if store_changed:
             save_quant_store(app.quant_pickle_path, self.store)
@@ -1325,7 +1367,9 @@ class MarkEventsWindow:
             return
 
         row_index = self._current_row_index()
-        self.store["rows"][row_index]["Man. Adj."] = value
+        row = self.store["rows"][row_index]
+        row["Man. Adj."] = value
+        update_row_bc_corr_norm_trc(row, value)
         save_quant_store(self.app.quant_pickle_path, self.store)
 
     def _refresh_all(self) -> None:
@@ -2446,7 +2490,11 @@ class StackAnalyzerApp:
         self._apply_quant_settings_to_all_rows(self._current_quant_settings())
         if self._active_saved_roi_row_index is not None:
             row_index = self._active_saved_roi_row_index
-            store["rows"][row_index] = self._build_quant_row(recompute_bleach=True)
+            existing = store["rows"][row_index]
+            store["rows"][row_index] = self._build_quant_row(
+                recompute_bleach=True,
+                existing_row=existing,
+            )
             message = (
                 f"ROI updated in {self.quant_pickle_path.name} "
                 f"(row {row_index + 1} of {len(store['rows'])})."
@@ -2549,6 +2597,12 @@ class StackAnalyzerApp:
                 self.normalized_segments, self.rel_x, f_left, f_right
             )
 
+        man_adj = 0.0
+        marked_events = None
+        if existing_row is not None:
+            man_adj = parse_man_adj(existing_row.get("Man. Adj."))
+            marked_events = existing_row.get(MARKED_EVENTS_COLUMN)
+
         row = {
             "directory": os.path.dirname(os.path.abspath(self.file_path)),
             "size": format_stack_size(width, height, self.n_frames),
@@ -2567,12 +2621,16 @@ class StackAnalyzerApp:
             "max vals": np.asarray(max_vals, dtype=np.float64) if max_vals else np.array([]),
             "bleach correct": None,
             "BC baseline": None,
+            "Man. Adj.": man_adj,
+            MARKED_EVENTS_COLUMN: marked_events,
+            BC_CORR_NORM_TRC_COLUMN: None,
         }
         if recompute_bleach:
             update_row_bleach_correction(row)
         elif existing_row is not None:
             row["bleach correct"] = existing_row.get("bleach correct")
             row["BC baseline"] = existing_row.get("BC baseline")
+            update_row_bc_corr_norm_trc(row)
         return row
 
     def _on_starts_changed(self, text: str) -> None:
@@ -2729,6 +2787,9 @@ class StackAnalyzerApp:
             self.slider_window.set_val(min(51, self.slider_window.valmax))
 
         store = load_quant_store(self.quant_pickle_path)
+        store_changed = backfill_bleach_correction(store) or backfill_bc_corr_norm_trc(store)
+        if store_changed:
+            save_quant_store(self.quant_pickle_path, store)
         pickle_settings = self._pickle_settings_for_stack(store)
         if pickle_settings is not None:
             self._apply_quant_settings_to_gui(pickle_settings)
