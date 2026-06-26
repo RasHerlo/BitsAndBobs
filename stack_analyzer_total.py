@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import os
 import pickle
+import textwrap
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
@@ -29,6 +30,7 @@ from stack_analyzer import (
 )
 
 COLLECT_PICKLE_NAME = "pickle_stack_collect.pkl"
+RESULTS_EXPORT_BASENAME = "results_figure.pdf"
 
 COLLECT_COLUMNS = [
     "directory",
@@ -739,6 +741,349 @@ def max_evoked_event_count(rows: list[dict]) -> int:
     return max_count
 
 
+def row_n_frames(row: dict) -> int:
+    trace = row.get(BC_CORR_NORM_TRC_COLUMN)
+    if trace is None:
+        return 0
+    return int(np.asarray(trace).size)
+
+
+def row_event_mask(row: dict, n_frames: int) -> np.ndarray:
+    mask = np.zeros(n_frames, dtype=bool)
+    for start, end_exclusive in evoked_intervals_exclusive(row, n_frames):
+        start = max(0, min(int(start), n_frames))
+        end_exclusive = max(start, min(int(end_exclusive), n_frames))
+        mask[start:end_exclusive] = True
+    for start, end_inclusive in parse_marked_events(row.get(MARKED_EVENTS_COLUMN)):
+        start = max(0, min(int(start), n_frames - 1))
+        end_inclusive = max(start, min(int(end_inclusive), n_frames - 1))
+        mask[start : end_inclusive + 1] = True
+    return mask
+
+
+def group_rows_by_experiment(
+    rows: list[dict],
+    collect_directory: str | Path,
+    *,
+    stored_base: str | Path | None = None,
+) -> list[tuple[str, list[dict]]]:
+    groups: dict[str, list[dict]] = {}
+    order: list[str] = []
+    for row in rows:
+        directory = row.get("directory")
+        if directory:
+            key = resolve_collect_directory_value(
+                directory, collect_directory, stored_base=stored_base
+            )
+        else:
+            key = "<unknown>"
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append(row)
+    return [(key, sorted(groups[key], key=lambda item: int(item.get("ROI #") or 0))) for key in order]
+
+
+def experiment_display_names(keys: list[str]) -> dict[str, str]:
+    """Use the first path segment where experiment directories differ."""
+    if not keys:
+        return {}
+    if len(keys) == 1:
+        key = keys[0]
+        if not key or key == "<unknown>":
+            return {key: key}
+        parts = Path(key).parts
+        return {key: parts[-1] if parts else key}
+
+    parts_list = [Path(key).parts for key in keys]
+    min_len = min(len(parts) for parts in parts_list)
+    diff_index: int | None = None
+    for index in range(min_len):
+        if len({parts[index] for parts in parts_list}) > 1:
+            diff_index = index
+            break
+    if diff_index is None and max(len(parts) for parts in parts_list) > min_len:
+        diff_index = min_len
+
+    labels: dict[str, str] = {}
+    for key, parts in zip(keys, parts_list):
+        if not key or key == "<unknown>":
+            labels[key] = key
+        elif diff_index is not None and diff_index < len(parts):
+            labels[key] = parts[diff_index]
+        elif parts:
+            labels[key] = parts[-1]
+        else:
+            labels[key] = key
+    return labels
+
+
+def frame_axis_seconds(n_frames: int, freq_avr_text) -> np.ndarray:
+    if n_frames <= 0:
+        return np.array([], dtype=np.float64)
+    try:
+        fps, avr = parse_freq_avr_field(freq_avr_text)
+    except (TypeError, ValueError):
+        return np.arange(n_frames, dtype=np.float64)
+    if fps <= 0 or avr <= 0:
+        return np.arange(n_frames, dtype=np.float64)
+    return np.arange(n_frames, dtype=np.float64) / (fps / avr)
+
+
+RASTER_GREY = np.array([0.82, 0.82, 0.82])
+RASTER_BLACK = np.array([0.08, 0.08, 0.08])
+RASTER_RED = np.array([0.82, 0.18, 0.18])
+COACTIVITY_OFF = np.array([0.93, 0.93, 0.93])
+COACTIVITY_ON = np.array([0.12, 0.12, 0.12])
+
+
+def build_experiment_raster(
+    experiment_rows: list[dict], n_frames: int
+) -> tuple[np.ndarray, list[dict], np.ndarray]:
+    n_rois = len(experiment_rows)
+    img = np.tile(RASTER_GREY, (n_rois + 1, n_frames, 1))
+    roi_masks: list[np.ndarray] = []
+
+    for roi_idx, row in enumerate(experiment_rows):
+        row_index = roi_idx + 1
+        for start, end_exclusive in evoked_intervals_exclusive(row, n_frames):
+            start = max(0, min(int(start), n_frames))
+            end_exclusive = max(start, min(int(end_exclusive), n_frames))
+            img[row_index, start:end_exclusive] = RASTER_BLACK
+        for start, end_inclusive in parse_marked_events(row.get(MARKED_EVENTS_COLUMN)):
+            start = max(0, min(int(start), n_frames - 1))
+            end_inclusive = max(start, min(int(end_inclusive), n_frames - 1))
+            img[row_index, start : end_inclusive + 1] = RASTER_RED
+        roi_masks.append(row_event_mask(row, n_frames))
+
+    if roi_masks:
+        coactivity = np.any(np.stack(roi_masks, axis=0), axis=0)
+    else:
+        coactivity = np.zeros(n_frames, dtype=bool)
+    img[0, coactivity] = COACTIVITY_ON
+    img[0, ~coactivity] = COACTIVITY_OFF
+    return img, experiment_rows, coactivity
+
+
+def compute_timing_panel_data(
+    rows: list[dict],
+    collect_directory: str | Path,
+    *,
+    stored_base: str | Path | None = None,
+) -> dict:
+    grouped = group_rows_by_experiment(rows, collect_directory, stored_base=stored_base)
+    labels = experiment_display_names([key for key, _rows in grouped])
+    experiments: list[dict] = []
+    for key, experiment_rows in grouped:
+        n_frames = max((row_n_frames(row) for row in experiment_rows), default=0)
+        if n_frames <= 0:
+            continue
+        _, _, coactivity = build_experiment_raster(experiment_rows, n_frames)
+        experiments.append(
+            {
+                "key": key,
+                "label": labels.get(key, key),
+                "rows": experiment_rows,
+                "n_rois": len(experiment_rows),
+                "n_frames": n_frames,
+                "coactivity_fraction": float(np.mean(coactivity)) if coactivity.size else 0.0,
+            }
+        )
+    return {
+        "experiments": experiments,
+        "n_rows": len(rows),
+        "n_experiments": len(experiments),
+    }
+
+
+MARKED_OVERLAY_COLOR = "#d81b60"
+
+
+def pool_indexed_evoked_segments(
+    rows: list[dict],
+) -> list[tuple[np.ndarray, int, object]]:
+    pooled: list[tuple[np.ndarray, int, object]] = []
+    for row in rows:
+        segments = row.get("Evoked Events")
+        if not isinstance(segments, list):
+            continue
+        freq_avr = row.get("freq + avr")
+        for event_index, segment in enumerate(segments):
+            if isinstance(segment, np.ndarray) and segment.size:
+                pooled.append((np.asarray(segment, dtype=np.float64), event_index, freq_avr))
+    return pooled
+
+
+def pool_marked_segments(rows: list[dict]) -> list[tuple[np.ndarray, object]]:
+    pooled: list[tuple[np.ndarray, object]] = []
+    for row in rows:
+        segments = row.get("Marked Events")
+        if not isinstance(segments, list):
+            continue
+        freq_avr = row.get("freq + avr")
+        for segment in segments:
+            if isinstance(segment, np.ndarray) and segment.size:
+                pooled.append((np.asarray(segment, dtype=np.float64), freq_avr))
+    return pooled
+
+
+def segment_values_for_overlay(
+    segment: np.ndarray,
+    freq_avr_text,
+    *,
+    derivative: bool = False,
+) -> tuple[np.ndarray, np.ndarray]:
+    times = frame_axis_seconds(int(segment.size), freq_avr_text)
+    if not derivative:
+        return times, segment
+    if times.size > 1:
+        return times, np.gradient(segment, times)
+    return times, np.zeros_like(segment)
+
+
+def stack_segments_mean_seconds(
+    segments: list[np.ndarray],
+    freq_avr_texts: list,
+) -> tuple[np.ndarray, np.ndarray]:
+    if not segments:
+        return np.array([], dtype=np.float64), np.array([], dtype=np.float64)
+
+    time_axes: list[np.ndarray] = []
+    dts: list[float] = []
+    for segment, freq_avr in zip(segments, freq_avr_texts):
+        times = frame_axis_seconds(int(segment.size), freq_avr)
+        time_axes.append(times)
+        if times.size > 1:
+            dts.append(float(times[1] - times[0]))
+        elif times.size == 1:
+            dts.append(1.0)
+
+    dt = min(dts) if dts else 1.0
+    t_max = max(float(times[-1]) for times in time_axes if times.size)
+    grid = np.arange(0.0, t_max + dt / 2, dt, dtype=np.float64)
+
+    stacked = np.full((len(segments), grid.size), np.nan, dtype=np.float64)
+    for index, (segment, times) in enumerate(zip(segments, time_axes)):
+        if times.size == 0:
+            continue
+        if times.size == 1:
+            nearest = int(np.argmin(np.abs(grid - times[0])))
+            stacked[index, nearest] = segment[0]
+            continue
+        valid = (grid >= times[0]) & (grid <= times[-1])
+        if np.any(valid):
+            stacked[index, valid] = np.interp(grid[valid], times, segment)
+    return grid, np.nanmean(stacked, axis=0)
+
+
+def compute_overlay_panel_data(rows: list[dict]) -> dict:
+    evoked_segments = pool_indexed_evoked_segments(rows)
+    marked_segments = pool_marked_segments(rows)
+    return {
+        "n_rows": len(rows),
+        "n_evoked_segments": len(evoked_segments),
+        "n_marked_segments": len(marked_segments),
+    }
+
+
+def draw_segment_overlay_ax(
+    ax,
+    segments: list[tuple[np.ndarray, object]],
+    *,
+    title: str,
+    ylabel: str,
+    color: str = MARKED_OVERLAY_COLOR,
+    derivative: bool = False,
+) -> None:
+    ax.clear()
+    if not segments:
+        ax.text(
+            0.5,
+            0.5,
+            "No segment data available.",
+            transform=ax.transAxes,
+            ha="center",
+            va="center",
+        )
+        ax.set_title(title)
+        ax.set_xticks([])
+        ax.set_yticks([])
+        return
+
+    plotted_segments: list[np.ndarray] = []
+    freq_avr_texts: list[object] = []
+    for segment, freq_avr in segments:
+        times, values = segment_values_for_overlay(
+            segment, freq_avr, derivative=derivative
+        )
+        plotted_segments.append(values)
+        freq_avr_texts.append(freq_avr)
+        ax.plot(
+            times,
+            values,
+            color=color,
+            linewidth=0.8,
+            alpha=0.55,
+            zorder=2,
+        )
+
+    x_mean, mean_values = stack_segments_mean_seconds(plotted_segments, freq_avr_texts)
+    if x_mean.size:
+        ax.plot(x_mean, mean_values, color="black", linewidth=2.4, zorder=5)
+    ax.set_title(title)
+    ax.set_xlabel("Time (s)")
+    ax.set_ylabel(ylabel)
+
+
+def draw_indexed_segment_overlay_ax(
+    ax,
+    indexed_segments: list[tuple[np.ndarray, int, object]],
+    *,
+    title: str,
+    ylabel: str,
+    derivative: bool = False,
+) -> None:
+    ax.clear()
+    if not indexed_segments:
+        ax.text(
+            0.5,
+            0.5,
+            "No segment data available.",
+            transform=ax.transAxes,
+            ha="center",
+            va="center",
+        )
+        ax.set_title(title)
+        ax.set_xticks([])
+        ax.set_yticks([])
+        return
+
+    plotted_segments: list[np.ndarray] = []
+    freq_avr_texts: list[object] = []
+    for segment, event_index, freq_avr in indexed_segments:
+        times, values = segment_values_for_overlay(
+            segment, freq_avr, derivative=derivative
+        )
+        plotted_segments.append(values)
+        freq_avr_texts.append(freq_avr)
+        segment_color = SEGMENT_COLORS[event_index % len(SEGMENT_COLORS)]
+        ax.plot(
+            times,
+            values,
+            color=segment_color,
+            linewidth=0.8,
+            alpha=0.55,
+            zorder=2,
+        )
+
+    x_mean, mean_values = stack_segments_mean_seconds(plotted_segments, freq_avr_texts)
+    if x_mean.size:
+        ax.plot(x_mean, mean_values, color="black", linewidth=2.4, zorder=5)
+    ax.set_title(title)
+    ax.set_xlabel("Time (s)")
+    ax.set_ylabel(ylabel)
+
+
 def segment_duration_seconds(row: dict, segment) -> float:
     """Convert a trace segment length to seconds using freq + avr."""
     if not isinstance(segment, np.ndarray) or segment.size == 0:
@@ -813,7 +1158,7 @@ def compute_max_peak_panel_data(rows: list[dict]) -> dict:
 
     marked_peaks = pool_all_marked_peak_maxes(rows)
     mean_marked, sem_marked = mean_sem(marked_peaks)
-    labels.append("Marked")
+    labels.append("Spontaneous")
     means.append(mean_marked)
     sems.append(sem_marked)
 
@@ -855,7 +1200,7 @@ def compute_duration_panel_data(rows: list[dict]) -> dict:
     sems.append(sem)
 
     marked_durations = pool_all_marked_durations(rows)
-    labels.append("Marked")
+    labels.append("Spontaneous")
     values.append(marked_durations)
     mean_marked, sem_marked = mean_sem(marked_durations)
     means.append(mean_marked)
@@ -970,6 +1315,18 @@ def beeswarm_offsets(
     return offsets
 
 
+def build_overlay_panel_text(data: dict) -> str:
+    return (
+        f"(A) Evoked overlays and (B) their frame-wise derivatives show all "
+        f"{data['n_evoked_segments']} pooled evoked segment trace(s) aligned to event onset, "
+        "with thin lines colored by evoked position and a thick black mean trace. "
+        f"(C) Spontaneous overlays and (D) their derivatives show all "
+        f"{data['n_marked_segments']} pooled spontaneous segment(s) in magenta "
+        "with the same mean overlay, from "
+        f"{data['n_rows']} collected ROI row(s)."
+    )
+
+
 def build_max_peak_panel_text(data: dict) -> str:
     evoked_count = max(0, len(data["labels"]) - 2)
     evoked_clause = (
@@ -978,11 +1335,11 @@ def build_max_peak_panel_text(data: dict) -> str:
         else ("Evoked 1" if evoked_count == 1 else "no indexed evoked events")
     )
     return (
-        "(A) Max Peak: mean maximum normalized BC-corrected trace value "
+        "(E) Max Peak: mean maximum normalized BC-corrected trace value "
         f"from {data['n_rows']} collected ROI row(s). "
         f"Indexed evoked bars ({evoked_clause}) use one peak per ROI per event; "
         f"'All evoked' pools {data['n_evoked_peaks']} evoked segment peak(s); "
-        f"'Marked' pools {data['n_marked_peaks']} marked segment peak(s). "
+        f"'Spontaneous' pools {data['n_marked_peaks']} spontaneous segment peak(s). "
         "Error bars are SEM. The red dotted line and grey band show the global mean "
         f"± SEM across {data['n_non_event_points']} pooled non-event trace point(s)."
     )
@@ -996,21 +1353,48 @@ def build_duration_panel_text(data: dict) -> str:
         else ("Evoked 1" if evoked_count == 1 else "no indexed evoked events")
     )
     return (
-        "(B) Duration: segment length converted to seconds as "
+        "(F) Duration: segment length converted to seconds as "
         "frames / (acquisition fps / averaging factor) using each row's "
         f"freq + avr field from {data['n_rows']} collected ROI row(s). "
         f"Indexed evoked groups ({evoked_clause}) use one duration per ROI per event; "
         f"'All evoked' pools {data['n_evoked_durations']} evoked segment(s); "
-        f"'Marked' pools {data['n_marked_durations']} marked segment(s). "
+        f"'Spontaneous' pools {data['n_marked_durations']} spontaneous segment(s). "
         "Colored dots show individual segment durations; black horizontal lines with "
         "error bars indicate mean ± SEM within each category."
     )
 
 
-def build_results_figure_text(peak_data: dict, duration_data: dict) -> str:
+def build_timing_panel_text(data: dict) -> str:
+    if data["n_experiments"] == 0:
+        return (
+            "(G) Timing: no experiment groups with trace data were available for raster plots."
+        )
+    experiment_clause = (
+        f"{data['n_experiments']} experiment/FOV group(s)"
+        if data["n_experiments"] != 1
+        else "one experiment/FOV group"
+    )
     return (
-        f"Figure 1. {build_max_peak_panel_text(peak_data)} "
-        f"{build_duration_panel_text(duration_data)}"
+        f"(G) Timing: {experiment_clause} from {data['n_rows']} collected ROI row(s), "
+        "grouped by stack directory within the same field of view. "
+        "Each raster row is one ROI on a grey background; black spans are evoked segments "
+        "and red spans are spontaneous events. The top row shows co-activity "
+        "(active when any ROI has an evoked or spontaneous event at that time), "
+        "used to assess whether spontaneous events are local to one ROI or shared across ROIs."
+    )
+
+
+def build_results_figure_text(
+    overlay_data: dict,
+    peak_data: dict,
+    duration_data: dict,
+    timing_data: dict,
+) -> str:
+    return (
+        f"Figure 1. {build_overlay_panel_text(overlay_data)} "
+        f"{build_max_peak_panel_text(peak_data)} "
+        f"{build_duration_panel_text(duration_data)} "
+        f"{build_timing_panel_text(timing_data)}"
     )
 
 
@@ -1041,6 +1425,141 @@ def draw_category_mean_sem(
         )
 
 
+def prompt_results_export_format(parent: tk.Misc) -> str | None:
+    """Return export format key ('pdf') or None if cancelled."""
+    choice: list[str | None] = [None]
+
+    dialog = tk.Toplevel(parent)
+    dialog.title("Export Results")
+    dialog.transient(parent)
+    dialog.grab_set()
+    dialog.resizable(False, False)
+
+    tk.Label(dialog, text="Format:").grid(row=0, column=0, padx=10, pady=10, sticky="w")
+    format_var = tk.StringVar(value="PDF (.pdf)")
+    format_combo = ttk.Combobox(
+        dialog,
+        textvariable=format_var,
+        values=["PDF (.pdf)"],
+        state="readonly",
+        width=20,
+    )
+    format_combo.grid(row=0, column=1, padx=10, pady=10, sticky="ew")
+
+    button_frame = tk.Frame(dialog)
+    button_frame.grid(row=1, column=0, columnspan=2, pady=(0, 10))
+
+    def accept() -> None:
+        selected = format_var.get()
+        if selected.startswith("PDF"):
+            choice[0] = "pdf"
+        dialog.destroy()
+
+    def cancel() -> None:
+        dialog.destroy()
+
+    tk.Button(button_frame, text="Export", width=10, command=accept).pack(side="left", padx=4)
+    tk.Button(button_frame, text="Cancel", width=10, command=cancel).pack(side="left", padx=4)
+    dialog.bind("<Escape>", lambda _event: cancel())
+    dialog.protocol("WM_DELETE_WINDOW", cancel)
+    dialog.wait_window()
+    return choice[0]
+
+
+def resolve_results_export_path(parent: tk.Misc, default_path: Path) -> Path | None:
+    """Resolve export path, prompting to overwrite or rename if needed."""
+    if not default_path.exists():
+        return default_path
+
+    response = messagebox.askyesnocancel(
+        "File exists",
+        f"{default_path.name} already exists in:\n{default_path.parent}\n\n"
+        "Choose Yes to overwrite, No to rename, or Cancel.",
+        parent=parent,
+    )
+    if response is None:
+        return None
+    if response:
+        return default_path
+
+    renamed = filedialog.asksaveasfilename(
+        parent=parent,
+        title="Export Results As",
+        initialdir=str(default_path.parent),
+        initialfile=f"{default_path.stem}_copy{default_path.suffix}",
+        defaultextension=default_path.suffix,
+        filetypes=[("PDF files", "*.pdf")],
+    )
+    if not renamed:
+        return None
+    return Path(renamed)
+
+
+def estimate_caption_height_inches(caption: str, *, figure_width: float) -> float:
+    chars_per_line = max(70, int(figure_width * 10.5))
+    line_count = 0
+    for paragraph in caption.split("\n"):
+        paragraph = paragraph.strip()
+        if not paragraph:
+            line_count += 1
+            continue
+        line_count += len(textwrap.wrap(paragraph, width=chars_per_line)) or 1
+    return min(4.5, max(1.1, 0.2 * line_count + 0.45))
+
+
+def attach_figure_caption(fig: Figure, caption: str) -> dict:
+    """Reserve space below plots for caption text during export."""
+    axes = list(fig.axes)
+    width, height = fig.get_size_inches()
+    caption_height = estimate_caption_height_inches(caption, figure_width=width)
+    gap_height = 0.25
+    new_height = height + caption_height + gap_height
+
+    state = {
+        "size": (float(width), float(height)),
+        "axes": axes,
+        "positions": [ax.get_position().bounds for ax in axes],
+    }
+
+    fig.set_size_inches(width, new_height, forward=True)
+    caption_fraction = caption_height / new_height
+    gap_fraction = gap_height / new_height
+    plot_scale = height / new_height
+
+    for ax in axes:
+        pos = ax.get_position()
+        ax.set_position(
+            [
+                pos.x0,
+                (pos.y0 * plot_scale) + caption_fraction + gap_fraction,
+                pos.width,
+                pos.height * plot_scale,
+            ]
+        )
+
+    caption_ax = fig.add_axes([0.05, 0.01, 0.9, max(0.08, caption_fraction - 0.01)])
+    caption_ax.set_axis_off()
+    caption_ax.text(
+        0.0,
+        1.0,
+        caption,
+        transform=caption_ax.transAxes,
+        va="top",
+        ha="left",
+        fontsize=8,
+        wrap=True,
+    )
+    state["caption_ax"] = caption_ax
+    return state
+
+
+def detach_figure_caption(fig: Figure, state: dict) -> None:
+    state["caption_ax"].remove()
+    fig.set_size_inches(state["size"][0], state["size"][1], forward=True)
+    for ax, bounds in zip(state["axes"], state["positions"]):
+        ax.set_position(bounds)
+
+
 class ResultsWindow:
     """Results figure window for the collected dataset."""
 
@@ -1059,27 +1578,58 @@ class ResultsWindow:
 
         self.root = tk.Toplevel(app.root)
         self.root.title("Results")
-        self.root.geometry("1040x980")
-        self.root.minsize(820, 760)
+        self.root.geometry("1560x1180")
+        self.root.minsize(1180, 860)
 
         plot_frame = tk.Frame(self.root)
         plot_frame.pack(fill="both", expand=True, padx=8, pady=8)
 
-        self.fig = Figure(figsize=(10.0, 9.0), dpi=100)
-        gs = self.fig.add_gridspec(2, 1, height_ratios=[1, 1], hspace=0.38)
-        self.ax_a = self.fig.add_subplot(gs[0])
-        self.ax_b = self.fig.add_subplot(gs[1])
+        self.fig = Figure(figsize=(15.5, 11.0), dpi=100)
         self.canvas = FigureCanvasTkAgg(self.fig, master=plot_frame)
         self.canvas.get_tk_widget().pack(fill="both", expand=True)
 
         caption_frame = tk.LabelFrame(self.root, text="Figure Text", padx=8, pady=8)
         caption_frame.pack(fill="x", padx=8, pady=(0, 8))
-        self.caption_text = tk.Text(caption_frame, height=7, wrap="word")
+        self.caption_text = tk.Text(caption_frame, height=11, wrap="word")
         self.caption_text.pack(fill="x")
         self.caption_text.config(state="disabled")
 
+        button_frame = tk.Frame(self.root)
+        button_frame.pack(fill="x", padx=8, pady=(0, 8))
+        tk.Button(button_frame, text="Export…", command=self._export_figure).pack(side="right")
+
         self._draw_figure(self.rows)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _export_figure(self) -> None:
+        export_format = prompt_results_export_format(self.root)
+        if export_format is None:
+            return
+        if export_format != "pdf":
+            messagebox.showerror("Export", f"Unsupported export format: {export_format}", parent=self.root)
+            return
+
+        default_path = self.app.collect_path.parent / RESULTS_EXPORT_BASENAME
+        export_path = resolve_results_export_path(self.root, default_path)
+        if export_path is None:
+            return
+
+        caption = self.caption_text.get("1.0", "end-1c").strip()
+        caption_state = None
+        try:
+            if caption:
+                caption_state = attach_figure_caption(self.fig, caption)
+            self.fig.savefig(export_path, format="pdf", pad_inches=0.2)
+        except OSError as exc:
+            messagebox.showerror("Export failed", str(exc), parent=self.root)
+            return
+        finally:
+            if caption_state is not None:
+                detach_figure_caption(self.fig, caption_state)
+                self.fig.tight_layout()
+                self.canvas.draw_idle()
+
+        messagebox.showinfo("Export", f"Saved results figure to:\n{export_path}", parent=self.root)
 
     def _on_close(self) -> None:
         self.app._results_window = None
@@ -1092,11 +1642,93 @@ class ResultsWindow:
         self.caption_text.config(state="disabled")
 
     def _draw_figure(self, rows: list[dict]) -> None:
-        peak_data = self._draw_max_peak_on_ax(self.ax_a, rows)
-        duration_data = self._draw_duration_on_ax(self.ax_b, rows)
+        timing_data = compute_timing_panel_data(
+            rows,
+            self.app.collect_directory,
+            stored_base=self.app.stored_collect_directory,
+        )
+        timing_height = max(1.0, timing_data["n_experiments"] * 0.9)
+
+        self.fig.clear()
+        gs = self.fig.add_gridspec(
+            3,
+            2,
+            width_ratios=[1.15, 1.0],
+            height_ratios=[1.0, 1.0, timing_height],
+            wspace=0.34,
+            hspace=0.42,
+        )
+        gs_left = gs[:, 0].subgridspec(2, 2, hspace=0.35, wspace=0.28)
+        ax_evoked = self.fig.add_subplot(gs_left[0, 0])
+        ax_evoked_deriv = self.fig.add_subplot(gs_left[0, 1])
+        ax_marked = self.fig.add_subplot(gs_left[1, 0])
+        ax_marked_deriv = self.fig.add_subplot(gs_left[1, 1])
+
+        ax_peak = self.fig.add_subplot(gs[0, 1])
+        ax_duration = self.fig.add_subplot(gs[1, 1])
+        if timing_data["n_experiments"] > 0:
+            gs_timing = gs[2, 1].subgridspec(timing_data["n_experiments"], 1, hspace=0.55)
+            timing_axes = [
+                self.fig.add_subplot(gs_timing[i]) for i in range(timing_data["n_experiments"])
+            ]
+        else:
+            timing_axes = [self.fig.add_subplot(gs[2, 1])]
+
+        overlay_data = self._draw_overlay_on_axes(
+            ax_evoked,
+            ax_evoked_deriv,
+            ax_marked,
+            ax_marked_deriv,
+            rows,
+        )
+        peak_data = self._draw_max_peak_on_ax(ax_peak, rows)
+        duration_data = self._draw_duration_on_ax(ax_duration, rows)
+        timing_data = self._draw_timing_on_axes(timing_axes, timing_data)
         self.fig.tight_layout()
         self.canvas.draw_idle()
-        self._set_caption(build_results_figure_text(peak_data, duration_data))
+        self._set_caption(
+            build_results_figure_text(overlay_data, peak_data, duration_data, timing_data)
+        )
+
+    def _draw_overlay_on_axes(
+        self,
+        ax_evoked,
+        ax_evoked_deriv,
+        ax_marked,
+        ax_marked_deriv,
+        rows: list[dict],
+    ) -> dict:
+        data = compute_overlay_panel_data(rows)
+        evoked_segments = pool_indexed_evoked_segments(rows)
+        marked_segments = pool_marked_segments(rows)
+
+        draw_indexed_segment_overlay_ax(
+            ax_evoked,
+            evoked_segments,
+            title="(A) Evoked",
+            ylabel="Normalized trace",
+        )
+        draw_indexed_segment_overlay_ax(
+            ax_evoked_deriv,
+            evoked_segments,
+            title="(B) Evoked derivative",
+            ylabel="d(trace)/d(time)",
+            derivative=True,
+        )
+        draw_segment_overlay_ax(
+            ax_marked,
+            marked_segments,
+            title="(C) Spontaneous",
+            ylabel="Normalized trace",
+        )
+        draw_segment_overlay_ax(
+            ax_marked_deriv,
+            marked_segments,
+            title="(D) Spontaneous derivative",
+            ylabel="d(trace)/d(time)",
+            derivative=True,
+        )
+        return data
 
     def _draw_max_peak_on_ax(self, ax, rows: list[dict]) -> dict:
         data = compute_max_peak_panel_data(rows)
@@ -1140,7 +1772,7 @@ class ResultsWindow:
             ax.text(
                 0.5,
                 0.5,
-                "No evoked or marked segment data available.",
+                "No evoked or spontaneous segment data available.",
                 transform=ax.transAxes,
                 ha="center",
                 va="center",
@@ -1157,7 +1789,7 @@ class ResultsWindow:
                     zorder=1,
                 )
 
-        ax.set_title("(A) Max Peak")
+        ax.set_title("(E) Max Peak")
         return data
 
     def _draw_duration_on_ax(self, ax, rows: list[dict]) -> dict:
@@ -1210,14 +1842,88 @@ class ResultsWindow:
             ax.text(
                 0.5,
                 0.5,
-                "No evoked or marked segment data available.",
+                "No evoked or spontaneous segment data available.",
                 transform=ax.transAxes,
                 ha="center",
                 va="center",
             )
 
-        ax.set_title("(B) Duration")
+        ax.set_title("(F) Duration")
         return data
+
+    def _draw_timing_on_axes(self, axes, timing_data: dict) -> dict:
+        experiments = timing_data["experiments"]
+        if not experiments:
+            ax = axes[0]
+            ax.clear()
+            ax.text(
+                0.5,
+                0.5,
+                "No experiment groups with trace data available.",
+                transform=ax.transAxes,
+                ha="center",
+                va="center",
+            )
+            ax.set_title("(G) Timing")
+            ax.set_xticks([])
+            ax.set_yticks([])
+            return timing_data
+
+        for ax, experiment in zip(axes, experiments):
+            ax.clear()
+            experiment_rows = experiment["rows"]
+            n_frames = int(experiment["n_frames"])
+            img, sorted_rows, _coactivity = build_experiment_raster(experiment_rows, n_frames)
+            times = frame_axis_seconds(n_frames, experiment_rows[0].get("freq + avr"))
+            if times.size:
+                if times.size > 1:
+                    dt = float(times[1] - times[0])
+                else:
+                    dt = 1.0
+                extent = [float(times[0] - dt / 2), float(times[-1] + dt / 2), len(sorted_rows) + 1, 0]
+            else:
+                extent = [0, 1, len(sorted_rows) + 1, 0]
+
+            ax.imshow(
+                img,
+                aspect="auto",
+                interpolation="nearest",
+                origin="upper",
+                extent=extent,
+            )
+            ax.axhline(1.0, color="0.35", linewidth=0.8, zorder=2)
+
+            y_labels = ["Co-activity"] + [
+                f"ROI {row.get('ROI #', idx + 1)}" for idx, row in enumerate(sorted_rows)
+            ]
+            y_ticks = np.arange(len(y_labels)) + 0.5
+            ax.set_yticks(y_ticks)
+            ax.set_yticklabels(y_labels)
+            ax.set_title(experiment["label"], fontsize=9)
+            if ax is axes[-1]:
+                ax.set_xlabel("Time (s)")
+            else:
+                ax.set_xticklabels([])
+
+        axes[0].text(
+            0.0,
+            1.12,
+            "(G) Timing",
+            transform=axes[0].transAxes,
+            fontsize=11,
+            fontweight="bold",
+            va="bottom",
+        )
+        axes[0].plot([], [], color="0.08", linewidth=6, label="Evoked")
+        axes[0].plot([], [], color=(0.82, 0.18, 0.18), linewidth=6, label="Spontaneous")
+        axes[0].legend(
+            loc="upper right",
+            bbox_to_anchor=(1.0, 1.12),
+            fontsize=8,
+            frameon=False,
+            handlelength=1.2,
+        )
+        return timing_data
 
 
 class StackAnalyzerTotalApp:
