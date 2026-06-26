@@ -11,14 +11,18 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 import numpy as np
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.figure import Figure
 
 from portable_paths import path_for_storage, path_from_storage, resolve_directory
 from stack_analyzer import (
     BC_CORR_NORM_TRC_COLUMN,
     MARKED_EVENTS_COLUMN,
     ROI_QUANT_PICKLE_NAME,
+    SEGMENT_COLORS,
     format_quant_value_detail,
     load_quant_store,
+    parse_freq_avr_field,
     parse_marked_events,
     parse_start_frames,
     summarize_quant_cell,
@@ -655,6 +659,567 @@ def open_collect_pickle_inspector(
     window.protocol("WM_DELETE_WINDOW", on_close)
 
 
+def mean_sem(values) -> tuple[float, float]:
+    arr = np.asarray(values, dtype=np.float64)
+    arr = arr[np.isfinite(arr)]
+    if arr.size == 0:
+        return float("nan"), float("nan")
+    mean = float(np.mean(arr))
+    if arr.size < 2:
+        return mean, 0.0
+    sem = float(np.std(arr, ddof=1) / np.sqrt(arr.size))
+    return mean, sem
+
+
+def iter_segment_peak_maxes(segments) -> list[float]:
+    if not isinstance(segments, list):
+        return []
+    peaks: list[float] = []
+    for segment in segments:
+        if not isinstance(segment, np.ndarray) or segment.size == 0:
+            continue
+        valid = segment[np.isfinite(segment)]
+        if valid.size:
+            peaks.append(float(np.max(valid)))
+    return peaks
+
+
+def peaks_for_evoked_index(rows: list[dict], event_index: int) -> list[float]:
+    peaks: list[float] = []
+    for row in rows:
+        evoked = row.get("Evoked Events")
+        if not isinstance(evoked, list) or event_index >= len(evoked):
+            continue
+        segment = evoked[event_index]
+        if not isinstance(segment, np.ndarray) or segment.size == 0:
+            continue
+        valid = segment[np.isfinite(segment)]
+        if valid.size:
+            peaks.append(float(np.max(valid)))
+    return peaks
+
+
+def pool_all_evoked_peak_maxes(rows: list[dict]) -> list[float]:
+    peaks: list[float] = []
+    for row in rows:
+        peaks.extend(iter_segment_peak_maxes(row.get("Evoked Events")))
+    return peaks
+
+
+def pool_all_marked_peak_maxes(rows: list[dict]) -> list[float]:
+    peaks: list[float] = []
+    for row in rows:
+        peaks.extend(iter_segment_peak_maxes(row.get("Marked Events")))
+    return peaks
+
+
+def pool_all_non_event_points(rows: list[dict]) -> np.ndarray:
+    parts: list[np.ndarray] = []
+    for row in rows:
+        non_events = row.get("Non-events")
+        if not isinstance(non_events, list):
+            continue
+        for segment in non_events:
+            if not isinstance(segment, np.ndarray) or segment.size == 0:
+                continue
+            valid = segment[np.isfinite(segment)]
+            if valid.size:
+                parts.append(valid.astype(np.float64, copy=False))
+    if not parts:
+        return np.array([], dtype=np.float64)
+    return np.concatenate(parts)
+
+
+def max_evoked_event_count(rows: list[dict]) -> int:
+    max_count = 0
+    for row in rows:
+        evoked = row.get("Evoked Events")
+        if isinstance(evoked, list):
+            max_count = max(max_count, len(evoked))
+    return max_count
+
+
+def segment_duration_seconds(row: dict, segment) -> float:
+    """Convert a trace segment length to seconds using freq + avr."""
+    if not isinstance(segment, np.ndarray) or segment.size == 0:
+        return float("nan")
+    text = row.get("freq + avr")
+    if not text:
+        return float("nan")
+    try:
+        fps, avr = parse_freq_avr_field(text)
+    except (TypeError, ValueError):
+        return float("nan")
+    if fps <= 0 or avr <= 0:
+        return float("nan")
+    n_frames = int(segment.size)
+    return n_frames / (fps / avr)
+
+
+def iter_segment_durations(row: dict, segments) -> list[float]:
+    if not isinstance(segments, list):
+        return []
+    durations: list[float] = []
+    for segment in segments:
+        duration = segment_duration_seconds(row, segment)
+        if np.isfinite(duration):
+            durations.append(duration)
+    return durations
+
+
+def durations_for_evoked_index(rows: list[dict], event_index: int) -> list[float]:
+    durations: list[float] = []
+    for row in rows:
+        evoked = row.get("Evoked Events")
+        if not isinstance(evoked, list) or event_index >= len(evoked):
+            continue
+        duration = segment_duration_seconds(row, evoked[event_index])
+        if np.isfinite(duration):
+            durations.append(duration)
+    return durations
+
+
+def pool_all_evoked_durations(rows: list[dict]) -> list[float]:
+    durations: list[float] = []
+    for row in rows:
+        durations.extend(iter_segment_durations(row, row.get("Evoked Events")))
+    return durations
+
+
+def pool_all_marked_durations(rows: list[dict]) -> list[float]:
+    durations: list[float] = []
+    for row in rows:
+        durations.extend(iter_segment_durations(row, row.get("Marked Events")))
+    return durations
+
+
+def compute_max_peak_panel_data(rows: list[dict]) -> dict:
+    labels: list[str] = []
+    means: list[float] = []
+    sems: list[float] = []
+
+    for event_index in range(max_evoked_event_count(rows)):
+        peaks = peaks_for_evoked_index(rows, event_index)
+        mean, sem = mean_sem(peaks)
+        labels.append(f"Evoked {event_index + 1}")
+        means.append(mean)
+        sems.append(sem)
+
+    all_evoked_peaks = pool_all_evoked_peak_maxes(rows)
+    mean, sem = mean_sem(all_evoked_peaks)
+    labels.append("All evoked")
+    means.append(mean)
+    sems.append(sem)
+
+    marked_peaks = pool_all_marked_peak_maxes(rows)
+    mean_marked, sem_marked = mean_sem(marked_peaks)
+    labels.append("Marked")
+    means.append(mean_marked)
+    sems.append(sem_marked)
+
+    non_event_points = pool_all_non_event_points(rows)
+    ref_mean, ref_sem = mean_sem(non_event_points)
+
+    return {
+        "labels": labels,
+        "means": means,
+        "sems": sems,
+        "reference_mean": ref_mean,
+        "reference_sem": ref_sem,
+        "n_rows": len(rows),
+        "n_evoked_peaks": len(all_evoked_peaks),
+        "n_marked_peaks": len(marked_peaks),
+        "n_non_event_points": int(non_event_points.size),
+    }
+
+
+def compute_duration_panel_data(rows: list[dict]) -> dict:
+    labels: list[str] = []
+    values: list[list[float]] = []
+    means: list[float] = []
+    sems: list[float] = []
+
+    for event_index in range(max_evoked_event_count(rows)):
+        durations = durations_for_evoked_index(rows, event_index)
+        labels.append(f"Evoked {event_index + 1}")
+        values.append(durations)
+        mean, sem = mean_sem(durations)
+        means.append(mean)
+        sems.append(sem)
+
+    all_evoked_durations = pool_all_evoked_durations(rows)
+    labels.append("All evoked")
+    values.append(all_evoked_durations)
+    mean, sem = mean_sem(all_evoked_durations)
+    means.append(mean)
+    sems.append(sem)
+
+    marked_durations = pool_all_marked_durations(rows)
+    labels.append("Marked")
+    values.append(marked_durations)
+    mean_marked, sem_marked = mean_sem(marked_durations)
+    means.append(mean_marked)
+    sems.append(sem_marked)
+
+    return {
+        "labels": labels,
+        "values": values,
+        "means": means,
+        "sems": sems,
+        "n_rows": len(rows),
+        "n_evoked_durations": len(all_evoked_durations),
+        "n_marked_durations": len(marked_durations),
+    }
+
+
+def max_peak_bar_colors(labels: list[str]) -> list[str]:
+    """Match Mark Events segment colors for indexed evoked peaks."""
+    colors: list[str] = []
+    for label in labels:
+        if label.startswith("Evoked ") and label != "All evoked":
+            try:
+                event_index = int(label.split()[-1]) - 1
+            except ValueError:
+                event_index = len(colors)
+            colors.append(SEGMENT_COLORS[event_index % len(SEGMENT_COLORS)])
+        else:
+            colors.append("0.55")
+    return colors
+
+
+def focused_value_ylim(
+    values: np.ndarray,
+    errors: np.ndarray | None = None,
+    *,
+    reference: float | None = None,
+    reference_error: float | None = None,
+    padding_fraction: float = 0.12,
+    min_padding: float = 0.01,
+) -> tuple[float, float] | None:
+    """Y-limits that zoom to data range (not forced to zero)."""
+    lows: list[float] = []
+    highs: list[float] = []
+
+    values = np.asarray(values, dtype=np.float64)
+    if errors is None:
+        errors = np.zeros_like(values)
+    else:
+        errors = np.asarray(errors, dtype=np.float64)
+
+    for value, err in zip(values, errors):
+        if not np.isfinite(value):
+            continue
+        err = err if np.isfinite(err) else 0.0
+        lows.append(float(value - err))
+        highs.append(float(value + err))
+
+    if reference is not None and np.isfinite(reference):
+        ref_err = reference_error if reference_error is not None and np.isfinite(reference_error) else 0.0
+        lows.append(float(reference - ref_err))
+        highs.append(float(reference + ref_err))
+
+    if not lows:
+        return None
+
+    y_min = min(lows)
+    y_max = max(highs)
+    span = y_max - y_min
+    padding = max(span * padding_fraction, min_padding) if span > 0 else min_padding
+    return y_min - padding, y_max + padding
+
+
+def beeswarm_offsets(
+    y_values: np.ndarray,
+    *,
+    x_width: float = 0.35,
+    point_diameter: float = 0.07,
+) -> np.ndarray:
+    """Spread x offsets so overlapping points remain visible."""
+    y = np.asarray(y_values, dtype=np.float64)
+    n = y.size
+    if n == 0:
+        return np.zeros(0, dtype=np.float64)
+    if n == 1:
+        return np.zeros(1, dtype=np.float64)
+
+    y_span = float(np.nanmax(y) - np.nanmin(y))
+    y_tol = max(y_span * 0.015, 1e-6)
+    order = np.argsort(y, kind="mergesort")
+    offsets = np.zeros(n, dtype=np.float64)
+    placed: list[tuple[float, float]] = []
+
+    for idx in order:
+        yi = float(y[idx])
+        chosen = 0.0
+        for step in range(64):
+            candidates = (0.0,) if step == 0 else (step * point_diameter, -step * point_diameter)
+            for cand in candidates:
+                if abs(cand) > x_width:
+                    break
+                if all(
+                    abs(cand - px) >= point_diameter or abs(yi - py) >= y_tol
+                    for px, py in placed
+                ):
+                    chosen = cand
+                    break
+            else:
+                continue
+            break
+        offsets[idx] = chosen
+        placed.append((chosen, yi))
+    return offsets
+
+
+def build_max_peak_panel_text(data: dict) -> str:
+    evoked_count = max(0, len(data["labels"]) - 2)
+    evoked_clause = (
+        f"Evoked 1–{evoked_count}"
+        if evoked_count > 1
+        else ("Evoked 1" if evoked_count == 1 else "no indexed evoked events")
+    )
+    return (
+        "(A) Max Peak: mean maximum normalized BC-corrected trace value "
+        f"from {data['n_rows']} collected ROI row(s). "
+        f"Indexed evoked bars ({evoked_clause}) use one peak per ROI per event; "
+        f"'All evoked' pools {data['n_evoked_peaks']} evoked segment peak(s); "
+        f"'Marked' pools {data['n_marked_peaks']} marked segment peak(s). "
+        "Error bars are SEM. The red dotted line and grey band show the global mean "
+        f"± SEM across {data['n_non_event_points']} pooled non-event trace point(s)."
+    )
+
+
+def build_duration_panel_text(data: dict) -> str:
+    evoked_count = max(0, len(data["labels"]) - 2)
+    evoked_clause = (
+        f"Evoked 1–{evoked_count}"
+        if evoked_count > 1
+        else ("Evoked 1" if evoked_count == 1 else "no indexed evoked events")
+    )
+    return (
+        "(B) Duration: segment length converted to seconds as "
+        "frames / (acquisition fps / averaging factor) using each row's "
+        f"freq + avr field from {data['n_rows']} collected ROI row(s). "
+        f"Indexed evoked groups ({evoked_clause}) use one duration per ROI per event; "
+        f"'All evoked' pools {data['n_evoked_durations']} evoked segment(s); "
+        f"'Marked' pools {data['n_marked_durations']} marked segment(s). "
+        "Colored dots show individual segment durations; black horizontal lines with "
+        "error bars indicate mean ± SEM within each category."
+    )
+
+
+def build_results_figure_text(peak_data: dict, duration_data: dict) -> str:
+    return (
+        f"Figure 1. {build_max_peak_panel_text(peak_data)} "
+        f"{build_duration_panel_text(duration_data)}"
+    )
+
+
+def draw_category_mean_sem(
+    ax,
+    x_center: float,
+    mean: float,
+    sem: float,
+    *,
+    half_width: float = 0.18,
+    zorder: int = 5,
+) -> None:
+    """Per-category mean indicator without connecting adjacent categories."""
+    if not np.isfinite(mean):
+        return
+    ax.hlines(mean, x_center - half_width, x_center + half_width, colors="k", linewidth=1.8, zorder=zorder)
+    if np.isfinite(sem) and sem > 0:
+        ax.errorbar(
+            [x_center],
+            [mean],
+            yerr=[sem],
+            fmt="none",
+            ecolor="k",
+            elinewidth=1.2,
+            capsize=5,
+            capthick=1.5,
+            zorder=zorder,
+        )
+
+
+class ResultsWindow:
+    """Results figure window for the collected dataset."""
+
+    def __init__(self, app: "StackAnalyzerTotalApp") -> None:
+        rows = list(app.store.get("rows", []))
+        if not rows:
+            messagebox.showinfo(
+                "Results",
+                "No collected rows available. Add experiments and rebuild the collection first.",
+            )
+            return
+
+        self.app = app
+        app._results_window = self
+        self.rows = rows
+
+        self.root = tk.Toplevel(app.root)
+        self.root.title("Results")
+        self.root.geometry("1040x980")
+        self.root.minsize(820, 760)
+
+        plot_frame = tk.Frame(self.root)
+        plot_frame.pack(fill="both", expand=True, padx=8, pady=8)
+
+        self.fig = Figure(figsize=(10.0, 9.0), dpi=100)
+        gs = self.fig.add_gridspec(2, 1, height_ratios=[1, 1], hspace=0.38)
+        self.ax_a = self.fig.add_subplot(gs[0])
+        self.ax_b = self.fig.add_subplot(gs[1])
+        self.canvas = FigureCanvasTkAgg(self.fig, master=plot_frame)
+        self.canvas.get_tk_widget().pack(fill="both", expand=True)
+
+        caption_frame = tk.LabelFrame(self.root, text="Figure Text", padx=8, pady=8)
+        caption_frame.pack(fill="x", padx=8, pady=(0, 8))
+        self.caption_text = tk.Text(caption_frame, height=7, wrap="word")
+        self.caption_text.pack(fill="x")
+        self.caption_text.config(state="disabled")
+
+        self._draw_figure(self.rows)
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _on_close(self) -> None:
+        self.app._results_window = None
+        self.root.destroy()
+
+    def _set_caption(self, caption: str) -> None:
+        self.caption_text.config(state="normal")
+        self.caption_text.delete("1.0", "end")
+        self.caption_text.insert("1.0", caption)
+        self.caption_text.config(state="disabled")
+
+    def _draw_figure(self, rows: list[dict]) -> None:
+        peak_data = self._draw_max_peak_on_ax(self.ax_a, rows)
+        duration_data = self._draw_duration_on_ax(self.ax_b, rows)
+        self.fig.tight_layout()
+        self.canvas.draw_idle()
+        self._set_caption(build_results_figure_text(peak_data, duration_data))
+
+    def _draw_max_peak_on_ax(self, ax, rows: list[dict]) -> dict:
+        data = compute_max_peak_panel_data(rows)
+        ax.clear()
+
+        labels = data["labels"]
+        means = np.asarray(data["means"], dtype=np.float64)
+        sems = np.asarray(data["sems"], dtype=np.float64)
+
+        ref_mean = data["reference_mean"]
+        ref_sem = data["reference_sem"]
+
+        if labels and np.any(np.isfinite(means)):
+            x = np.arange(len(labels))
+            valid_sem = np.where(np.isfinite(sems), sems, 0.0)
+            y_limits = focused_value_ylim(
+                means,
+                valid_sem,
+                reference=ref_mean,
+                reference_error=ref_sem,
+            )
+            bar_bottom = y_limits[0] if y_limits is not None else 0.0
+            bar_colors = max_peak_bar_colors(labels)
+            ax.bar(
+                x,
+                means - bar_bottom,
+                bottom=bar_bottom,
+                yerr=valid_sem,
+                capsize=4,
+                color=bar_colors,
+                edgecolor=bar_colors,
+                linewidth=0.8,
+                zorder=3,
+            )
+            ax.set_xticks(x)
+            ax.set_xticklabels(labels, rotation=30 if len(labels) > 4 else 0, ha="right")
+            ax.set_ylabel("Max peak (normalized)")
+            if y_limits is not None:
+                ax.set_ylim(y_limits)
+        else:
+            ax.text(
+                0.5,
+                0.5,
+                "No evoked or marked segment data available.",
+                transform=ax.transAxes,
+                ha="center",
+                va="center",
+            )
+
+        if np.isfinite(ref_mean):
+            ax.axhline(ref_mean, color="red", linestyle=":", linewidth=1.5, zorder=4)
+            if np.isfinite(ref_sem) and ref_sem > 0:
+                ax.axhspan(
+                    ref_mean - ref_sem,
+                    ref_mean + ref_sem,
+                    color="0.75",
+                    alpha=0.35,
+                    zorder=1,
+                )
+
+        ax.set_title("(A) Max Peak")
+        return data
+
+    def _draw_duration_on_ax(self, ax, rows: list[dict]) -> dict:
+        data = compute_duration_panel_data(rows)
+        ax.clear()
+
+        labels = data["labels"]
+        groups = data["values"]
+        means = np.asarray(data["means"], dtype=np.float64)
+        sems = np.asarray(data["sems"], dtype=np.float64)
+
+        has_values = any(len(group) > 0 for group in groups)
+        if labels and has_values:
+            x = np.arange(len(labels))
+            colors = max_peak_bar_colors(labels)
+            all_values: list[float] = []
+
+            for xi, (group, color) in enumerate(zip(groups, colors)):
+                arr = np.asarray(group, dtype=np.float64)
+                arr = arr[np.isfinite(arr)]
+                if arr.size == 0:
+                    continue
+                all_values.extend(arr.tolist())
+                offsets = beeswarm_offsets(arr)
+                ax.scatter(
+                    xi + offsets,
+                    arr,
+                    s=30,
+                    color=color,
+                    edgecolor="0.25",
+                    linewidth=0.5,
+                    alpha=0.9,
+                    zorder=3,
+                )
+
+            valid_sem = np.where(np.isfinite(sems), sems, 0.0)
+            finite_means = np.where(np.isfinite(means), means, np.nan)
+            for xi, mean, sem in zip(x, finite_means, valid_sem):
+                draw_category_mean_sem(ax, float(xi), float(mean), float(sem))
+
+            ax.set_xticks(x)
+            ax.set_xticklabels(labels, rotation=30 if len(labels) > 4 else 0, ha="right")
+            ax.set_ylabel("Duration (s)")
+
+            if all_values:
+                y_limits = focused_value_ylim(np.asarray(all_values, dtype=np.float64))
+                if y_limits is not None:
+                    ax.set_ylim(y_limits)
+        else:
+            ax.text(
+                0.5,
+                0.5,
+                "No evoked or marked segment data available.",
+                transform=ax.transAxes,
+                ha="center",
+                va="center",
+            )
+
+        ax.set_title("(B) Duration")
+        return data
+
+
 class StackAnalyzerTotalApp:
     def __init__(self, initial_dir: str | None = None) -> None:
         self.collect_directory = (
@@ -663,6 +1228,7 @@ class StackAnalyzerTotalApp:
         self.stored_collect_directory = self.collect_directory
         self.store = empty_collect_store(self.collect_directory)
         self.collect_path = collect_pickle_path_for_directory(self.collect_directory)
+        self._results_window: ResultsWindow | None = None
 
         self.root = tk.Tk()
         self.root.title("Stack Analyzer Total")
@@ -727,6 +1293,7 @@ class StackAnalyzerTotalApp:
         tk.Button(button_col, text="Inspect Pickle", width=16, command=self._on_inspect_pickle).pack(
             pady=(0, 6)
         )
+        tk.Button(button_col, text="Results", width=16, command=self._on_results).pack()
 
         footer = tk.Frame(self.root, padx=10, pady=8)
         footer.pack(fill="both", expand=False)
@@ -930,6 +1497,31 @@ class StackAnalyzerTotalApp:
             collect_directory=self.collect_directory,
             stored_base=self.stored_collect_directory,
         )
+
+    def _on_results(self) -> None:
+        if self._results_window is not None:
+            try:
+                if self._results_window.root.winfo_exists():
+                    self._results_window.root.lift()
+                    self._results_window.root.focus_force()
+                    return
+            except (tk.TclError, AttributeError):
+                pass
+            self._results_window = None
+
+        if not self.collect_path.exists():
+            messagebox.showinfo(
+                "Results",
+                f"No collection file found at:\n{self.collect_path}\n\nRebuild the collection first.",
+            )
+            return
+        if not self.store.get("rows"):
+            messagebox.showinfo(
+                "Results",
+                "No collected rows available. Add experiments and rebuild the collection.",
+            )
+            return
+        ResultsWindow(self)
 
     def run(self) -> None:
         self.root.mainloop()
