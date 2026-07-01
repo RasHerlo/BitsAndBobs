@@ -52,6 +52,8 @@ QUANT_COLUMNS = [
     "max vals",
     "bleach correct",
     "BC baseline",
+    "fit params",
+    "BC auto shift",
     "Man. Adj.",
     "Marked events",
     "BC-corr. Norm-Trc",
@@ -59,6 +61,8 @@ QUANT_COLUMNS = [
 
 MARKED_EVENTS_COLUMN = "Marked events"
 BC_CORR_NORM_TRC_COLUMN = "BC-corr. Norm-Trc"
+FIT_PARAMS_COLUMN = "fit params"
+BC_AUTO_SHIFT_COLUMN = "BC auto shift"
 
 
 def quant_pickle_path_for_stack(stack_path: str) -> Path:
@@ -214,23 +218,46 @@ def biexponential_decay(t: np.ndarray, a1: float, tau1: float, a2: float, tau2: 
     return a1 * np.exp(-t / tau1) + a2 * np.exp(-t / tau2) + c
 
 
-def compute_bg_corrected_smooth_trace(
-    roi_trace: np.ndarray,
-    bg_trace: np.ndarray,
-    sg_window: int,
-    sg_poly: int,
-) -> np.ndarray:
-    roi = np.asarray(roi_trace, dtype=np.float64)
-    bg = np.asarray(bg_trace, dtype=np.float64)
-    length = min(len(roi), len(bg))
-    roi = roi[:length]
-    bg = bg[:length]
-    smooth_roi = apply_savgol(roi, sg_window, sg_poly)
-    smooth_bg = apply_savgol(bg, sg_window, sg_poly)
-    return smooth_roi - smooth_bg
+def format_fit_params(a1: float, tau1: float, a2: float, tau2: float, c: float) -> str:
+    return ", ".join(f"{float(value):.6g}" for value in (a1, tau1, a2, tau2, c))
 
 
-def fit_biexponential_bleach_correct(signal: np.ndarray) -> np.ndarray | None:
+def parse_fit_params(value) -> tuple[float, float, float, float, float] | None:
+    if value is None:
+        return None
+    parts = [p.strip() for p in str(value).split(",") if p.strip()]
+    if len(parts) < 5:
+        return None
+    try:
+        return tuple(float(parts[index]) for index in range(5))  # type: ignore[return-value]
+    except (TypeError, ValueError):
+        return None
+
+
+def parse_bc_auto_shift(value, *, default: bool = True) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "on"}:
+        return True
+    if text in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
+def format_bc_auto_shift(enabled: bool) -> int:
+    return 1 if enabled else 0
+
+
+def bleach_correct_from_fit_params(n_frames: int, params: tuple[float, float, float, float, float]) -> np.ndarray:
+    t = np.arange(int(n_frames), dtype=np.float64)
+    fitted = biexponential_decay(t, *params)
+    return np.asarray(fitted, dtype=np.float64)
+
+
+def fit_biexponential_params(signal: np.ndarray) -> tuple[float, float, float, float, float] | None:
     """Fit f(t) = A1*exp(-t/tau1) + A2*exp(-t/tau2) + C to the full trace."""
     values = np.asarray(signal, dtype=np.float64)
     if values.ndim != 1 or values.size < 6:
@@ -267,7 +294,56 @@ def fit_biexponential_bleach_correct(signal: np.ndarray) -> np.ndarray | None:
     fitted = biexponential_decay(t, *params)
     if not np.all(np.isfinite(fitted)):
         return None
-    return fitted.astype(np.float64)
+    return tuple(float(value) for value in params)
+
+
+def fit_biexponential_bleach_correct(signal: np.ndarray) -> np.ndarray | None:
+    params = fit_biexponential_params(signal)
+    if params is None:
+        return None
+    return bleach_correct_from_fit_params(len(signal), params)
+
+
+def compute_bc_baseline_for_smooth(
+    smooth: np.ndarray,
+    row: dict | None = None,
+) -> np.ndarray | None:
+    """Build BC baseline from stored fit params when available, else auto-fit."""
+    smooth = np.asarray(smooth, dtype=np.float64)
+    if smooth.size == 0:
+        return None
+
+    params = parse_fit_params(row.get(FIT_PARAMS_COLUMN)) if row is not None else None
+    if params is not None:
+        bleach_correct = bleach_correct_from_fit_params(smooth.size, params)
+    else:
+        bleach_correct = fit_biexponential_bleach_correct(smooth)
+    if bleach_correct is None:
+        return None
+
+    auto_shift = parse_bc_auto_shift(
+        row.get(BC_AUTO_SHIFT_COLUMN) if row is not None else None,
+        default=True,
+    )
+    if auto_shift:
+        return compute_bc_baseline_trace(bleach_correct, smooth)
+    return bleach_correct.astype(np.float64, copy=True)
+
+
+def compute_bg_corrected_smooth_trace(
+    roi_trace: np.ndarray,
+    bg_trace: np.ndarray,
+    sg_window: int,
+    sg_poly: int,
+) -> np.ndarray:
+    roi = np.asarray(roi_trace, dtype=np.float64)
+    bg = np.asarray(bg_trace, dtype=np.float64)
+    length = min(len(roi), len(bg))
+    roi = roi[:length]
+    bg = bg[:length]
+    smooth_roi = apply_savgol(roi, sg_window, sg_poly)
+    smooth_bg = apply_savgol(bg, sg_window, sg_poly)
+    return smooth_roi - smooth_bg
 
 
 def compute_bc_baseline_trace(
@@ -290,7 +366,7 @@ def compute_bc_baseline_trace(
 def row_needs_bleach_update(row: dict) -> bool:
     if row.get("BG trc") is None:
         return False
-    for column in ("bleach correct", "BC baseline"):
+    for column in ("bleach correct", "BC baseline", FIT_PARAMS_COLUMN):
         value = row.get(column)
         if value is None:
             return True
@@ -299,13 +375,14 @@ def row_needs_bleach_update(row: dict) -> bool:
     return False
 
 
-def update_row_bleach_correction(row: dict) -> bool:
+def update_row_bleach_correction(row: dict, *, force_auto_fit: bool = False) -> bool:
     """Compute bleach correct and BC baseline for one pickle row. Returns True if filled."""
     bg_trace = row.get("BG trc")
     roi_trace = row.get("ROI trc")
     if bg_trace is None or roi_trace is None:
         row["bleach correct"] = None
         row["BC baseline"] = None
+        row[FIT_PARAMS_COLUMN] = None
         row[BC_CORR_NORM_TRC_COLUMN] = None
         return False
 
@@ -314,22 +391,56 @@ def update_row_bleach_correction(row: dict) -> bool:
     except (ValueError, KeyError, TypeError):
         row["bleach correct"] = None
         row["BC baseline"] = None
+        row[FIT_PARAMS_COLUMN] = None
         row[BC_CORR_NORM_TRC_COLUMN] = None
         return False
+
+    if row.get(BC_AUTO_SHIFT_COLUMN) is None:
+        row[BC_AUTO_SHIFT_COLUMN] = format_bc_auto_shift(True)
 
     smooth = compute_bg_corrected_smooth_trace(roi_trace, bg_trace, sg_window, sg_poly)
-    bleach_correct = fit_biexponential_bleach_correct(smooth)
-    if bleach_correct is None:
+    params = None if force_auto_fit else parse_fit_params(row.get(FIT_PARAMS_COLUMN))
+    if params is None:
+        params = fit_biexponential_params(smooth)
+    if params is None:
         row["bleach correct"] = None
         row["BC baseline"] = None
+        row[FIT_PARAMS_COLUMN] = None
         row[BC_CORR_NORM_TRC_COLUMN] = None
         return False
 
-    bc_baseline = compute_bc_baseline_trace(bleach_correct, smooth)
+    bleach_correct = bleach_correct_from_fit_params(smooth.size, params)
+    row[FIT_PARAMS_COLUMN] = format_fit_params(*params)
+    auto_shift = parse_bc_auto_shift(row.get(BC_AUTO_SHIFT_COLUMN))
+    if auto_shift:
+        bc_baseline = compute_bc_baseline_trace(bleach_correct, smooth)
+    else:
+        bc_baseline = bleach_correct.astype(np.float64, copy=True)
+
     row["bleach correct"] = bleach_correct
     row["BC baseline"] = bc_baseline
     update_row_bc_corr_norm_trc(row)
     return True
+
+
+def update_row_fit_taus(row: dict, tau1: float, tau2: float) -> bool:
+    params = parse_fit_params(row.get(FIT_PARAMS_COLUMN))
+    if params is None:
+        if not update_row_bleach_correction(row, force_auto_fit=True):
+            return False
+        params = parse_fit_params(row.get(FIT_PARAMS_COLUMN))
+        if params is None:
+            return False
+    updated = (float(params[0]), float(tau1), float(params[2]), float(tau2), float(params[4]))
+    row[FIT_PARAMS_COLUMN] = format_fit_params(*updated)
+    return update_row_bleach_correction(row, force_auto_fit=False)
+
+
+def update_row_bc_auto_shift(row: dict, enabled: bool) -> bool:
+    row[BC_AUTO_SHIFT_COLUMN] = format_bc_auto_shift(enabled)
+    if parse_fit_params(row.get(FIT_PARAMS_COLUMN)) is None:
+        return update_row_bleach_correction(row, force_auto_fit=True)
+    return update_row_bleach_correction(row, force_auto_fit=False)
 
 
 def update_row_bc_corr_norm_trc(row: dict, man_adj: float | None = None) -> bool:
@@ -390,6 +501,9 @@ def ensure_man_adj_defaults(store: dict) -> bool:
     for row in store.get("rows", []):
         if row.get("Man. Adj.") is None:
             row["Man. Adj."] = 0.0
+            changed = True
+        if row.get(BC_AUTO_SHIFT_COLUMN) is None:
+            row[BC_AUTO_SHIFT_COLUMN] = format_bc_auto_shift(True)
             changed = True
     return changed
 
@@ -685,6 +799,8 @@ def open_quant_pickle_inspector(
         "max vals": 120,
         "bleach correct": 130,
         "BC baseline": 130,
+        "fit params": 150,
+        "BC auto shift": 90,
         "Man. Adj.": 70,
         "Marked events": 120,
         "BC-corr. Norm-Trc": 130,
@@ -1051,6 +1167,9 @@ class MarkEventsWindow:
 
         self._man_adj_step = 1.0
         self._updating_man_adj_field = False
+        self._tau1_step = 1.0
+        self._tau2_step = 1.0
+        self._updating_tau_fields = False
         self._add_event_active = False
         self._remove_event_active = False
         self._draft_start: int | None = None
@@ -1061,8 +1180,8 @@ class MarkEventsWindow:
 
         self.root = tk.Toplevel()
         self.root.title("Mark Events")
-        self.root.geometry("1240x760")
-        self.root.minsize(960, 580)
+        self.root.geometry("1520x760")
+        self.root.minsize(1100, 580)
 
         top = tk.Frame(self.root, padx=8, pady=6)
         top.pack(fill="x")
@@ -1072,8 +1191,29 @@ class MarkEventsWindow:
         self.row_label.pack(side="left", padx=10)
         tk.Button(top, text="▶", width=3, command=self._next_row).pack(side="left")
 
-        adj_frame = tk.Frame(top, padx=20)
-        adj_frame.pack(side="right")
+        top_controls = tk.Frame(top, padx=12)
+        top_controls.pack(side="right")
+
+        fit_frame = tk.Frame(top_controls)
+        fit_frame.pack(side="left", padx=(0, 10))
+
+        self._build_tau_controls(fit_frame, "τ₁", "tau1")
+        self._build_tau_controls(fit_frame, "τ₂", "tau2", pad_left=10)
+
+        self.bc_auto_shift_var = tk.BooleanVar(value=True)
+        self._updating_bc_auto_shift = False
+        self.bc_auto_shift_check = tk.Checkbutton(
+            fit_frame,
+            text="BC auto shift",
+            variable=self.bc_auto_shift_var,
+            command=self._on_bc_auto_shift_changed,
+        )
+        self.bc_auto_shift_check.pack(side="left", padx=(10, 6))
+
+        tk.Button(fit_frame, text="Reset fit", command=self._reset_fit).pack(side="left", padx=(4, 0))
+
+        adj_frame = tk.Frame(top_controls)
+        adj_frame.pack(side="left")
         tk.Label(adj_frame, text="Man. Adj.").pack(side="left", padx=(0, 6))
         tk.Button(adj_frame, text="▼", width=2, command=lambda: self._bump_man_adj(-1)).pack(
             side="left"
@@ -1383,6 +1523,137 @@ class MarkEventsWindow:
     def _current_row(self) -> dict:
         return self.entries[self.entry_pos][1]
 
+    def _build_tau_controls(self, parent: tk.Frame, label: str, attr: str, *, pad_left: int = 0) -> None:
+        frame = tk.Frame(parent)
+        frame.pack(side="left", padx=(pad_left, 0))
+        tk.Label(frame, text=label).pack(side="left", padx=(0, 4))
+        tk.Button(
+            frame,
+            text="▼",
+            width=2,
+            command=lambda: self._bump_tau(attr, -1),
+        ).pack(side="left")
+        var = tk.DoubleVar(value=1.0)
+        entry = tk.Entry(frame, textvariable=var, width=8, justify="center")
+        entry.pack(side="left", padx=3)
+        entry.bind("<Return>", self._on_tau_commit)
+        entry.bind("<FocusOut>", self._on_tau_commit)
+        var.trace_add("write", self._on_tau_live)
+        tk.Button(
+            frame,
+            text="▲",
+            width=2,
+            command=lambda: self._bump_tau(attr, 1),
+        ).pack(side="left")
+        setattr(self, f"{attr}_var", var)
+        setattr(self, f"{attr}_entry", entry)
+
+    def _tau_attr_index(self, attr: str) -> int:
+        return 1 if attr == "tau1" else 3
+
+    def _current_tau_value(self, attr: str) -> float:
+        var = getattr(self, f"{attr}_var")
+        try:
+            return float(var.get())
+        except (tk.TclError, ValueError):
+            params = parse_fit_params(self._current_row().get(FIT_PARAMS_COLUMN))
+            if params is None:
+                return 1.0
+            return float(params[self._tau_attr_index(attr)])
+
+    def _tau_step_for_attr(self, attr: str) -> float:
+        return self._tau1_step if attr == "tau1" else self._tau2_step
+
+    def _bump_tau(self, attr: str, direction: int) -> None:
+        current = self._current_tau_value(attr)
+        self._set_tau_var(attr, current + direction * self._tau_step_for_attr(attr))
+        self._save_fit_params_to_pickle()
+
+    def _on_tau_live(self, *_args) -> None:
+        if self._updating_tau_fields:
+            return
+        try:
+            float(self.tau1_var.get())
+            float(self.tau2_var.get())
+        except (tk.TclError, ValueError):
+            return
+        self._draw_traces()
+        self.canvas.draw_idle()
+
+    def _on_tau_commit(self, _event=None) -> None:
+        self._save_fit_params_to_pickle()
+
+    def _set_tau_var(self, attr: str, value: float) -> None:
+        self._updating_tau_fields = True
+        getattr(self, f"{attr}_var").set(value)
+        self._updating_tau_fields = False
+
+    def _sync_fit_controls_from_row(self, row: dict) -> None:
+        params = parse_fit_params(row.get(FIT_PARAMS_COLUMN))
+        self._updating_tau_fields = True
+        if params is None:
+            self.tau1_var.set(1.0)
+            self.tau2_var.set(1.0)
+        else:
+            self.tau1_var.set(float(params[1]))
+            self.tau2_var.set(float(params[3]))
+        self._updating_tau_fields = False
+
+        self._updating_bc_auto_shift = True
+        self.bc_auto_shift_var.set(parse_bc_auto_shift(row.get(BC_AUTO_SHIFT_COLUMN)))
+        self._updating_bc_auto_shift = False
+
+        if params is not None:
+            self._tau1_step = max(1e-6, abs(float(params[1])) * 0.02)
+            self._tau2_step = max(1e-6, abs(float(params[3])) * 0.02)
+        else:
+            self._tau1_step = 1.0
+            self._tau2_step = 1.0
+
+    def _save_fit_params_to_pickle(self) -> None:
+        if self._updating_tau_fields:
+            return
+        try:
+            tau1 = float(self.tau1_var.get())
+            tau2 = float(self.tau2_var.get())
+        except (tk.TclError, ValueError):
+            row = self._current_row()
+            self._sync_fit_controls_from_row(row)
+            return
+
+        row_index = self._current_row_index()
+        row = self.store["rows"][row_index]
+        if not update_row_fit_taus(row, tau1, tau2):
+            return
+        save_quant_store(self.app.quant_pickle_path, self.store)
+        self._draw_traces()
+        self.canvas.draw_idle()
+
+    def _on_bc_auto_shift_changed(self) -> None:
+        if self._updating_bc_auto_shift:
+            return
+        row_index = self._current_row_index()
+        row = self.store["rows"][row_index]
+        update_row_bc_auto_shift(row, bool(self.bc_auto_shift_var.get()))
+        save_quant_store(self.app.quant_pickle_path, self.store)
+        self._draw_traces()
+        self.canvas.draw_idle()
+
+    def _reset_fit(self) -> None:
+        row_index = self._current_row_index()
+        row = self.store["rows"][row_index]
+        if not update_row_bleach_correction(row, force_auto_fit=True):
+            messagebox.showinfo(
+                "Reset fit",
+                "Could not re-fit bleach correction for this row.",
+                parent=self.root,
+            )
+            return
+        save_quant_store(self.app.quant_pickle_path, self.store)
+        self._sync_fit_controls_from_row(row)
+        self._draw_traces()
+        self.canvas.draw_idle()
+
     def _prev_row(self) -> None:
         if self.entry_pos > 0:
             self.entry_pos -= 1
@@ -1442,6 +1713,7 @@ class MarkEventsWindow:
         self._updating_man_adj_field = True
         self.man_adj_var.set(man_adj)
         self._updating_man_adj_field = False
+        self._sync_fit_controls_from_row(row)
 
         smooth, _baseline, _normalized = compute_row_mark_event_traces(row, man_adj)
         if smooth is not None and smooth.size:
@@ -2210,6 +2482,55 @@ class StackAnalyzerApp:
         entries = self._stack_row_entries(store)
         return entries[0][1] if entries else None
 
+    def _first_stack_row_with_bg(self, store: dict) -> dict | None:
+        for _row_index, row in self._stack_row_entries(store):
+            if row.get("BG pixels") is not None:
+                return row
+        return None
+
+    def _get_stack_bg_from_store(
+        self, store: dict
+    ) -> tuple[np.ndarray | None, np.ndarray | None]:
+        """Return stack-canonical BG pixels and trace from the pickle (first row that has BG)."""
+        for _row_index, row in self._stack_row_entries(store):
+            pixels = row.get("BG pixels")
+            if pixels is None:
+                continue
+            pixels_arr = np.asarray(pixels, dtype=np.float64).copy()
+            trc = row.get("BG trc")
+            if trc is not None:
+                trc_arr = np.asarray(trc, dtype=np.float64).copy()
+            else:
+                trc_arr = self._compute_bg_trace_from_pixels(pixels_arr)
+            return pixels_arr, trc_arr
+        return None, None
+
+    def _resolve_bg_fields_for_quant_row(
+        self, store: dict
+    ) -> tuple[np.ndarray | None, np.ndarray | None]:
+        """Preserve stack BG from the pickle; fall back to the GUI only when no row has BG yet."""
+        canonical_pixels, canonical_trc = self._get_stack_bg_from_store(store)
+        if canonical_pixels is not None:
+            return canonical_pixels, canonical_trc
+
+        ui_pixels = None
+        if self.bg_roi_tool is not None and self.bg_roi_tool.vertices is not None:
+            ui_pixels = np.asarray(self.bg_roi_tool.vertices, dtype=np.float64).copy()
+        ui_trc = None
+        if self.raw_bg_trace is not None:
+            ui_trc = np.asarray(self.raw_bg_trace, dtype=np.float64).copy()
+        elif ui_pixels is not None:
+            ui_trc = self._compute_bg_trace_from_pixels(ui_pixels)
+        return ui_pixels, ui_trc
+
+    def _load_stack_bg_into_ui(self, store: dict) -> None:
+        bg_row = self._first_stack_row_with_bg(store)
+        if bg_row is not None:
+            self._load_bg_from_row(bg_row)
+        elif self.bg_roi_tool is not None:
+            self.bg_roi_tool.clear()
+            self.raw_bg_trace = None
+
     def _stack_rows_have_mismatched_bg(self, store: dict) -> bool:
         entries = self._stack_row_entries(store)
         if len(entries) <= 1:
@@ -2242,14 +2563,14 @@ class StackAnalyzerApp:
         return compute_raw_trace(self.stack, mask)
 
     def _copy_bg_from_first_stack_row(self, store: dict) -> bool:
-        first_row = self._first_stack_row(store)
-        if first_row is None:
+        bg_row = self._first_stack_row_with_bg(store)
+        if bg_row is None:
             return False
 
-        bg_pixels = first_row.get("BG pixels")
+        bg_pixels = bg_row.get("BG pixels")
         bg_trace = self._compute_bg_trace_from_pixels(bg_pixels)
         if bg_pixels is not None and bg_trace is None:
-            bg_trace = first_row.get("BG trc")
+            bg_trace = bg_row.get("BG trc")
 
         for _row_index, row in self._stack_row_entries(store):
             if bg_pixels is None:
@@ -2257,12 +2578,18 @@ class StackAnalyzerApp:
                 row["BG trc"] = None
                 row["bleach correct"] = None
                 row["BC baseline"] = None
+                row[FIT_PARAMS_COLUMN] = None
                 row[BC_CORR_NORM_TRC_COLUMN] = None
             else:
                 row["BG pixels"] = np.asarray(bg_pixels, dtype=np.float64).copy()
-                row["BG trc"] = np.asarray(bg_trace, dtype=np.float64).copy()
-                update_row_bleach_correction(row)
-                update_row_bc_corr_norm_trc(row)
+                row["BG trc"] = (
+                    None
+                    if bg_trace is None
+                    else np.asarray(bg_trace, dtype=np.float64).copy()
+                )
+                if row["BG trc"] is not None:
+                    update_row_bleach_correction(row, force_auto_fit=True)
+                    update_row_bc_corr_norm_trc(row)
         return True
 
     def _ensure_unified_bg_on_load(self, store: dict) -> bool:
@@ -2302,9 +2629,10 @@ class StackAnalyzerApp:
             if trace_copy is None:
                 row["bleach correct"] = None
                 row["BC baseline"] = None
+                row[FIT_PARAMS_COLUMN] = None
                 row[BC_CORR_NORM_TRC_COLUMN] = None
             else:
-                update_row_bleach_correction(row)
+                update_row_bleach_correction(row, force_auto_fit=True)
                 update_row_bc_corr_norm_trc(row)
 
         save_quant_store(self.quant_pickle_path, store)
@@ -2321,15 +2649,9 @@ class StackAnalyzerApp:
             return
 
         store = load_quant_store(self.quant_pickle_path)
-        first_row = self._first_stack_row(store)
         self._suppress_bg_change_prompt = True
         try:
-            if first_row is None:
-                self.raw_bg_trace = None
-                if self.bg_roi_tool is not None:
-                    self.bg_roi_tool.clear()
-            else:
-                self._load_bg_from_row(first_row, suppress_prompt=False)
+            self._load_stack_bg_into_ui(store)
         finally:
             self._suppress_bg_change_prompt = False
 
@@ -2607,7 +2929,8 @@ class StackAnalyzerApp:
         if row_index < 0 or row_index >= len(store["rows"]):
             return
         store["rows"][row_index] = self._build_quant_row(
-            existing_row=store["rows"][row_index]
+            existing_row=store["rows"][row_index],
+            store=store,
         )
         save_quant_store(self.quant_pickle_path, store)
 
@@ -2699,27 +3022,26 @@ class StackAnalyzerApp:
         if self.raw_trace is None:
             self._set_status_message("Cannot save ROI: ROI trace is not available.")
             return
+        if self._active_saved_roi_row_index is not None:
+            self._set_status_message(
+                "Selected ROI is saved automatically when edited. "
+                "Draw a new ROI to add another row."
+            )
+            return
 
         store = load_quant_store(self.quant_pickle_path)
-        self._apply_quant_settings_to_all_rows(self._current_quant_settings())
-        if self._active_saved_roi_row_index is not None:
-            row_index = self._active_saved_roi_row_index
-            existing = store["rows"][row_index]
-            store["rows"][row_index] = self._build_quant_row(
+        store["rows"].append(
+            self._build_quant_row(
                 recompute_bleach=True,
-                existing_row=existing,
+                force_auto_fit=False,
+                store=store,
             )
-            message = (
-                f"ROI updated in {self.quant_pickle_path.name} "
-                f"(row {row_index + 1} of {len(store['rows'])})."
-            )
-        else:
-            store["rows"].append(self._build_quant_row(recompute_bleach=True))
-            message = (
-                f"ROI saved to {self.quant_pickle_path.name} "
-                f"({len(store['rows'])} rows total)."
-            )
+        )
         save_quant_store(self.quant_pickle_path, store)
+        message = (
+            f"ROI saved to {self.quant_pickle_path.name} "
+            f"({len(store['rows'])} rows total)."
+        )
         self._set_status_message(message)
         if self.show_saved_rois:
             self._update_saved_roi_display()
@@ -2749,10 +3071,7 @@ class StackAnalyzerApp:
         save_quant_store(self.quant_pickle_path, store)
 
         self._deselect_saved_roi(clear_traces=False)
-        if self.bg_roi_tool is not None:
-            self.bg_roi_tool.clear()
-            self._sync_bg_draw_button()
-        self.raw_bg_trace = None
+        self._load_stack_bg_into_ui(store)
         self._update_roi_traces()
         if self.show_saved_rois:
             self._update_saved_roi_display()
@@ -2791,7 +3110,9 @@ class StackAnalyzerApp:
         self,
         *,
         recompute_bleach: bool = False,
+        force_auto_fit: bool = False,
         existing_row: dict | None = None,
+        store: dict | None = None,
     ) -> dict:
         width = self.stack.shape[2]
         height = self.stack.shape[1]
@@ -2800,9 +3121,13 @@ class StackAnalyzerApp:
         if f_right < f_left:
             f_left, f_right = f_right, f_left
 
-        bg_vertices = None
-        if self.bg_roi_tool is not None and self.bg_roi_tool.vertices is not None:
-            bg_vertices = np.asarray(self.bg_roi_tool.vertices, dtype=np.float64)
+        if store is None:
+            if self.quant_pickle_path is not None:
+                store = load_quant_store(self.quant_pickle_path)
+            else:
+                store = empty_quant_store()
+
+        bg_pixels, bg_trc = self._resolve_bg_fields_for_quant_row(store)
 
         roi_vertices = np.asarray(self.roi_tool.vertices, dtype=np.float64)
         max_vals: list[float] = []
@@ -2813,9 +3138,11 @@ class StackAnalyzerApp:
 
         man_adj = 0.0
         marked_events = None
+        bc_auto_shift = format_bc_auto_shift(True)
         if existing_row is not None:
             man_adj = parse_man_adj(existing_row.get("Man. Adj."))
             marked_events = existing_row.get(MARKED_EVENTS_COLUMN)
+            bc_auto_shift = existing_row.get(BC_AUTO_SHIFT_COLUMN, format_bc_auto_shift(True))
 
         row = {
             "directory": os.path.dirname(os.path.abspath(self.file_path)),
@@ -2827,23 +3154,32 @@ class StackAnalyzerApp:
             ),
             "extension": str(int(self.slider_extension.val)),
             "Area L+R": format_area_lr_field(f_left, f_right),
-            "BG pixels": bg_vertices,
-            "BG trc": None if self.raw_bg_trace is None else np.asarray(self.raw_bg_trace),
+            "BG pixels": bg_pixels,
+            "BG trc": bg_trc,
             "ROI pixels": roi_vertices,
             "ROI trc": np.asarray(self.raw_trace),
             "Area": self._compute_area(f_left, f_right),
             "max vals": np.asarray(max_vals, dtype=np.float64) if max_vals else np.array([]),
             "bleach correct": None,
             "BC baseline": None,
+            "fit params": None,
+            "BC auto shift": bc_auto_shift,
             "Man. Adj.": man_adj,
             MARKED_EVENTS_COLUMN: marked_events,
             BC_CORR_NORM_TRC_COLUMN: None,
         }
         if recompute_bleach:
-            update_row_bleach_correction(row)
+            update_row_bleach_correction(row, force_auto_fit=force_auto_fit)
         elif existing_row is not None:
-            row["bleach correct"] = existing_row.get("bleach correct")
-            row["BC baseline"] = existing_row.get("BC baseline")
+            row[FIT_PARAMS_COLUMN] = existing_row.get(FIT_PARAMS_COLUMN)
+            if row.get("BG trc") is not None and row.get("ROI trc") is not None:
+                update_row_bleach_correction(row, force_auto_fit=False)
+            else:
+                row["bleach correct"] = None
+                row["BC baseline"] = None
+                row[FIT_PARAMS_COLUMN] = None
+                row[BC_CORR_NORM_TRC_COLUMN] = None
+                return row
             update_row_bc_corr_norm_trc(row)
         return row
 
@@ -3006,9 +3342,7 @@ class StackAnalyzerApp:
             store_changed = True
         if store_changed:
             save_quant_store(self.quant_pickle_path, store)
-        first_row = self._first_stack_row(store)
-        if first_row is not None and first_row.get("BG pixels") is not None:
-            self._load_bg_from_row(first_row)
+        self._load_stack_bg_into_ui(store)
         pickle_settings = self._pickle_settings_for_stack(store)
         if pickle_settings is not None:
             self._apply_quant_settings_to_gui(pickle_settings)
@@ -3381,8 +3715,8 @@ class StackAnalyzerApp:
             return
 
         store = load_quant_store(self.quant_pickle_path) if self.quant_pickle_path else None
-        first_row = self._first_stack_row(store) if store is not None else None
-        canonical_pixels = None if first_row is None else first_row.get("BG pixels")
+        bg_row = self._first_stack_row_with_bg(store) if store is not None else None
+        canonical_pixels = None if bg_row is None else bg_row.get("BG pixels")
 
         mask = self.bg_roi_tool.mask
         new_vertices = (
@@ -3433,6 +3767,16 @@ class StackAnalyzerApp:
         smooth_bg = apply_savgol(self.raw_bg_trace, window, poly)
         return smooth_signal - smooth_bg
 
+    def _saved_row_for_bleach_display(self) -> dict | None:
+        if self._active_saved_roi_row_index is None or self.quant_pickle_path is None:
+            return None
+        store = load_quant_store(self.quant_pickle_path)
+        row_index = self._active_saved_roi_row_index
+        rows = store.get("rows", [])
+        if 0 <= row_index < len(rows):
+            return rows[row_index]
+        return None
+
     def _compute_bc_baseline_trace(self) -> np.ndarray | None:
         if self.raw_trace is None or self.raw_bg_trace is None:
             return None
@@ -3442,10 +3786,7 @@ class StackAnalyzerApp:
         smooth = compute_bg_corrected_smooth_trace(
             self.raw_trace, self.raw_bg_trace, window, poly
         )
-        bleach_correct = fit_biexponential_bleach_correct(smooth)
-        if bleach_correct is None:
-            return None
-        return compute_bc_baseline_trace(bleach_correct, smooth)
+        return compute_bc_baseline_for_smooth(smooth, self._saved_row_for_bleach_display())
 
     def _update_roi_traces(self) -> None:
         """Refresh ROI-based traces/plots only; heatmap is full-image and unchanged."""
