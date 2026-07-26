@@ -1,11 +1,12 @@
 # BitsAndBobs
 
-Small analysis tools for imaging workflows. The two main GUIs use **separate Python virtual environments** so their dependencies stay isolated.
+Small analysis tools for imaging workflows. Each GUI uses a **separate Python virtual environment** so dependencies stay isolated.
 
 | Tool | Script(s) | Environment | Requirements |
 |------|-----------|-------------|--------------|
 | Image Aligner | `Image_Aligner.py` | `venv_image_aligner` | `requirements_image_aligner.txt` |
 | Stack Analyzer | `stack_analyzer.py`, `stack_analyzer_total.py` | `venv_stack_analyzer` | `requirements_stack_analyzer.txt` |
+| Phase Aligner | `Phase_Aligner.py` | `venv_phase_aligner` | `requirements_phase_aligner.txt` |
 
 Shared helper used by Stack Analyzer / Total: `portable_paths.py` (drive-flexible path resolution for USB / remounted drives).
 
@@ -33,7 +34,17 @@ pip install -r requirements_stack_analyzer.txt
 
 Dependencies: `numpy`, `matplotlib`, `scipy`, `tifffile` (plus stdlib `tkinter`).
 
-Both venvs are gitignored (`venv_image_aligner/`, `venv_stack_analyzer/`).
+### Phase Aligner
+
+```powershell
+python -m venv venv_phase_aligner
+.\venv_phase_aligner\Scripts\Activate.ps1
+pip install -r requirements_phase_aligner.txt
+```
+
+Dependencies: `numpy`, `matplotlib`, `tifffile`.
+
+All venvs are gitignored (`venv_image_aligner/`, `venv_stack_analyzer/`, `venv_phase_aligner/`).
 
 ---
 
@@ -110,3 +121,35 @@ python stack_analyzer_total.py --collect-dir path\to\collection_folder
 1. Analyze each stack in `stack_analyzer.py` and save ROIs / mark events.
 2. In `stack_analyzer_total.py`, point at a collect folder, add the experiment pickles, and rebuild.
 3. Open **Results** (and optionally export) for cross-experiment summaries.
+
+---
+
+## Phase Aligner (`Phase_Aligner.py`)
+
+Interactive tool for correcting **bidirectional scan-line phase** on TIFF time stacks (frames × Y × X): even rows are shifted horizontally by an integer offset so they align with odd rows.
+
+**Expected folder layout**
+
+```
+DATA/
+  SUPPORT_ChanA/denoised_cut.tif
+  SUPPORT_ChanB/denoised_cut.tif
+```
+
+**What it does**
+- Browse a `DATA` folder and auto-load both `denoised_cut.tif` channels
+- Choose a **frame** to tune on (avoids motion blur from Z-averaging)
+- Display toggle: **Even–Odd** (cyan/magenta, default), **Turbo**, or **Grey**, all with 1–99% contrast stretch
+- Adjust a shared integer offset (even rows only; positive = right) with live preview on that frame
+- **Apply / Export** applies the same offset to **every frame** of both stacks and writes `denoised_cut_phase.tif`, plus a `log.txt` (offset + reference frame) in each channel folder
+
+Preview uses the selected frame so slider updates stay responsive; the full stacks are corrected only on export.
+
+**Run**
+
+```powershell
+.\venv_phase_aligner\Scripts\Activate.ps1
+python Phase_Aligner.py
+# or with an initial DATA folder:
+python Phase_Aligner.py path\to\DATA
+```
