@@ -79,11 +79,18 @@ Interactive GUI for fluorescence ROI analysis on TIFF stacks.
 - Bleach correction (biexponential fit) and BC-corrected normalized traces
 - Stimulus / event timing via start frames, extension window, acquisition fps, and averaging factor
 - Overlay aligned event segments and integrate response area
-- Optional pixel-wise heatmap of response area
+- Optional pixel-wise **area heatmap** on the z-average (see below)
 - Persist quantified ROIs to `ROI_quant pickle.pkl` next to the stack
 - **Inspect Pickle** — browse saved ROI quantification rows
 - **Mark Events** — inspect saved ROIs, adjust BC baseline shift, add/remove marked event intervals
 - Drive-flexible directory matching so ROI rows still match when a USB remounts under a different drive letter
+
+**Heatmap**
+- Toggle **Heatmap** on the image panel; use **Update heatmap** to recompute (enabled only when parameters that affect the map have changed)
+- Adjust SG window/order, extension, starts, and Area L/R freely; the ROI traces update immediately, but the heatmap waits until you click **Update heatmap**
+- Each pixel value is the **segment-quantification area** (same idea as the ROI mean normalized segment / Area L–R integral), **not** the bleach-corrected ROI−BG smooth
+- Per pixel: Savitzky–Golay on raw intensity → cut segments at start frames + extension → normalize by pre-stimulus baseline → average segments → integrate between Area L and Area R
+- Unlike the ROI segment trace (built from BG-corrected `ROI − BG` smooth), the heatmap smooths each pixel’s raw fluorescence only (no BG subtraction, no bleach correction)
 
 **Run**
 

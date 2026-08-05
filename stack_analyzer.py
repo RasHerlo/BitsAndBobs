@@ -2258,10 +2258,15 @@ class StackAnalyzerApp:
         show_rois_ax.set_axis_off()
         self.check_show_rois = widgets.CheckButtons(show_rois_ax, ["show ROIs"], [False])
         self.check_show_rois.on_clicked(self._on_show_rois_toggled)
-        toggle_ax = self.fig.add_subplot(left_gs[2, 0])
+        heatmap_row_gs = left_gs[2, 0].subgridspec(1, 2, width_ratios=[0.32, 0.68], wspace=0.06)
+        toggle_ax = self.fig.add_subplot(heatmap_row_gs[0, 0])
         toggle_ax.set_axis_off()
         self.check_heatmap = widgets.CheckButtons(toggle_ax, ["Heatmap"], [False])
         self.check_heatmap.on_clicked(self._on_heatmap_toggled)
+        ax_update_heatmap = self.fig.add_subplot(heatmap_row_gs[0, 1])
+        self.btn_update_heatmap = widgets.Button(ax_update_heatmap, "Update heatmap")
+        self.btn_update_heatmap.on_clicked(self._on_update_heatmap_clicked)
+        self._sync_heatmap_update_button()
 
         self.ax_raw = self.fig.add_subplot(gs[1, 1:3])
         self.ax_smooth = self.fig.add_subplot(gs[2, 1:3], sharex=self.ax_raw)
@@ -2441,6 +2446,20 @@ class StackAnalyzerApp:
 
     def _on_heatmap_toggled(self, _label: str) -> None:
         self.heatmap_enabled = bool(self.check_heatmap.get_status()[0])
+        if not self.heatmap_enabled:
+            self._clear_heatmap_layers()
+            self.ax_image.set_title("Z-average")
+            self.fig.canvas.draw_idle()
+        elif not self._heatmap_needs_update() and self.area_map_cache is not None:
+            self._show_heatmap_overlay()
+        self._sync_heatmap_update_button()
+
+    def _on_update_heatmap_clicked(self, _event) -> None:
+        if not self.heatmap_enabled or self.stack is None or self._heatmap_busy:
+            return
+        if not self._heatmap_needs_update():
+            self._sync_heatmap_update_button()
+            return
         self._update_heatmap_display()
 
     def _on_show_rois_toggled(self, _label: str) -> None:
@@ -2794,29 +2813,31 @@ class StackAnalyzerApp:
 
     def _apply_quant_settings_to_gui(self, settings: dict) -> None:
         self._applying_quant_settings = True
-        self.acq_fps = settings["acq_fps"]
-        self.avr_factor = settings["avr_factor"]
-        self.text_freq.set_val(str(settings["acq_fps"]))
-        self.text_avr.set_val(
-            str(int(settings["avr_factor"]))
-            if float(settings["avr_factor"]).is_integer()
-            else str(settings["avr_factor"])
-        )
-        self._update_effective_fps_display()
-        sg_window = min(int(settings["sg_window"]), int(self.slider_window.valmax))
-        sg_window = max(3, sg_window if sg_window % 2 else sg_window - 1)
-        self.slider_window.set_val(sg_window)
-        self.slider_poly.set_val(settings["sg_poly"])
-        self.slider_extension.set_val(settings["extension"])
-        self.start_frames = parse_start_frames(settings["starts"], self.n_frames)
-        self._sync_starts_textbox_from_frames(self.start_frames)
-        self._block_area_slider_callbacks = True
         try:
-            self.slider_area_left.set_val(settings["area_left"])
-            self.slider_area_right.set_val(settings["area_right"])
+            self.acq_fps = settings["acq_fps"]
+            self.avr_factor = settings["avr_factor"]
+            self.text_freq.set_val(str(settings["acq_fps"]))
+            self.text_avr.set_val(
+                str(int(settings["avr_factor"]))
+                if float(settings["avr_factor"]).is_integer()
+                else str(settings["avr_factor"])
+            )
+            self._update_effective_fps_display()
+            sg_window = min(int(settings["sg_window"]), int(self.slider_window.valmax))
+            sg_window = max(3, sg_window if sg_window % 2 else sg_window - 1)
+            self.slider_window.set_val(sg_window)
+            self.slider_poly.set_val(settings["sg_poly"])
+            self.slider_extension.set_val(settings["extension"])
+            self.start_frames = parse_start_frames(settings["starts"], self.n_frames)
+            self._sync_starts_textbox_from_frames(self.start_frames)
+            self._block_area_slider_callbacks = True
+            try:
+                self.slider_area_left.set_val(settings["area_left"])
+                self.slider_area_right.set_val(settings["area_right"])
+            finally:
+                self._block_area_slider_callbacks = False
         finally:
-            self._block_area_slider_callbacks = False
-        self._applying_quant_settings = False
+            self._applying_quant_settings = False
         self._update_analysis()
 
     def _apply_quant_settings_to_all_rows(self, settings: dict) -> None:
@@ -2967,15 +2988,14 @@ class StackAnalyzerApp:
         self.fig.canvas.draw_idle()
 
     def _on_area_slider_changed(self) -> None:
-        if self._block_area_slider_callbacks:
+        if self._block_area_slider_callbacks or self._applying_quant_settings:
             return
         self.area_map_cache = None
         self._update_plots()
         if self._active_saved_roi_row_index is not None:
             self._apply_quant_settings_to_all_rows(self._current_quant_settings())
             self._sync_active_quant_row()
-        if self.heatmap_enabled:
-            self._update_heatmap_display(integrate_only=True)
+        self._sync_heatmap_update_button()
 
     def _sync_draw_button(self) -> None:
         if self.roi_tool is None:
@@ -3297,10 +3317,7 @@ class StackAnalyzerApp:
         self.quant_pickle_path = ensure_quant_pickle(path)
         self.n_frames = stack.shape[0]
         self.z_average = compute_z_average(stack)
-        self._heatmap_traces_dirty = True
-        self.pixel_mean_trace = None
-        self.pixel_rel_x = None
-        self.area_map_cache = None
+        self._mark_heatmap_dirty()
 
         height, width = self.z_average.shape
         self._active_saved_roi_row_index = None
@@ -3363,6 +3380,44 @@ class StackAnalyzerApp:
         self.pixel_mean_trace = None
         self.pixel_rel_x = None
         self.area_map_cache = None
+        self._sync_heatmap_update_button()
+
+    def _heatmap_compute_params(self) -> tuple:
+        return (
+            tuple(int(s) for s in self.start_frames),
+            int(self.slider_window.val),
+            int(self.slider_poly.val),
+            int(self.slider_extension.val),
+            float(self.baseline_fraction),
+        )
+
+    def _heatmap_needs_update(self) -> bool:
+        if self.stack is None:
+            return False
+        if self._heatmap_traces_dirty or self.pixel_mean_trace is None or self.pixel_rel_x is None:
+            return True
+        if self.area_map_cache is None:
+            return True
+        return False
+
+    def _sync_heatmap_update_button(self) -> None:
+        button = getattr(self, "btn_update_heatmap", None)
+        if button is None:
+            return
+        enabled = (
+            self.heatmap_enabled
+            and self.stack is not None
+            and not self._heatmap_busy
+            and self._heatmap_needs_update()
+        )
+        button.set_active(enabled)
+        face = "0.85" if enabled else "0.92"
+        text = "0.1" if enabled else "0.55"
+        button.color = face
+        button.hovercolor = "0.95" if enabled else face
+        button.ax.patch.set_facecolor(face)
+        button.label.set_color(text)
+        self.fig.canvas.draw_idle()
 
     def _refresh_base_image(self) -> None:
         if self.z_average is None:
@@ -3440,10 +3495,12 @@ class StackAnalyzerApp:
         if not self._heatmap_traces_dirty and self.pixel_mean_trace is not None:
             return True
 
-        starts = self.start_frames
-        window = int(self.slider_window.val)
-        poly = int(self.slider_poly.val)
-        extension = int(self.slider_extension.val)
+        params = self._heatmap_compute_params()
+        starts = list(params[0])
+        window = params[1]
+        poly = params[2]
+        extension = params[3]
+        baseline_fraction = params[4]
 
         def report_progress(stage: str, fraction: float) -> None:
             self._set_heatmap_progress(stage, fraction)
@@ -3458,11 +3515,20 @@ class StackAnalyzerApp:
                 extension,
                 window,
                 poly,
-                self.baseline_fraction,
+                baseline_fraction,
                 progress=report_progress,
             )
         finally:
             self._block_area_slider_callbacks = False
+
+        if params != self._heatmap_compute_params():
+            # Parameters changed during compute (e.g. via flush_events); discard.
+            self._heatmap_traces_dirty = True
+            self.pixel_mean_trace = None
+            self.pixel_rel_x = None
+            self.area_map_cache = None
+            return False
+
         if result is None:
             self.pixel_mean_trace = None
             self.pixel_rel_x = None
@@ -3554,6 +3620,9 @@ class StackAnalyzerApp:
             f_left,
             f_right,
         )
+        if f_left != int(self.slider_area_left.val) or f_right != int(self.slider_area_right.val):
+            self.area_map_cache = None
+            return False
         self.area_map_cache = np.asarray(area_map, dtype=np.float64).reshape(height, width)
         return True
 
@@ -3619,6 +3688,7 @@ class StackAnalyzerApp:
                 self._heatmap_pending_full = True
             return
         self._heatmap_busy = True
+        self._sync_heatmap_update_button()
         try:
             self._update_heatmap_display_impl(integrate_only)
         finally:
@@ -3627,7 +3697,14 @@ class StackAnalyzerApp:
                 pending_full = self._heatmap_pending_full
                 self._heatmap_pending = False
                 self._heatmap_pending_full = False
-                self._update_heatmap_display(integrate_only=not pending_full)
+                # Only auto-rerun if an Update was requested while busy and
+                # there is still work to do with the latest parameters.
+                if self.heatmap_enabled and self._heatmap_needs_update():
+                    self._update_heatmap_display(integrate_only=not pending_full)
+                else:
+                    self._sync_heatmap_update_button()
+            else:
+                self._sync_heatmap_update_button()
 
     def _update_heatmap_display_impl(self, integrate_only: bool = False) -> None:
         if not self.heatmap_enabled or self.stack is None:
@@ -3648,6 +3725,12 @@ class StackAnalyzerApp:
 
         if need_traces:
             if not self._ensure_pixel_mean_traces():
+                self._clear_heatmap_progress()
+                if self._heatmap_traces_dirty:
+                    # Aborted because parameters changed mid-compute.
+                    self.ax_image.set_title("Z-average — heatmap outdated (click Update)")
+                    self.fig.canvas.draw_idle()
+                    return
                 self._clear_heatmap_layers()
                 self.ax_image.set_title("Z-average (heatmap: no valid segments)")
                 self.fig.canvas.draw_idle()
@@ -3801,11 +3884,11 @@ class StackAnalyzerApp:
         self._update_plots()
 
     def _update_analysis(self) -> None:
+        if self._applying_quant_settings:
+            return
         self._mark_heatmap_dirty()
         self._update_roi_traces()
         self._redraw_rois()
-        if self.heatmap_enabled:
-            self._update_heatmap_display()
 
     def _compute_mean_trace(self) -> None:
         self.rel_x = None
